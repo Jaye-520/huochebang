@@ -10,7 +10,7 @@ from time import monotonic
 import numpy as np
 from PIL import Image
 
-from .ocr import OCRRecognizer
+from .ocr import OCRRecognizer, PaddleOCRRecognizer
 from .vision import Line
 
 
@@ -104,7 +104,7 @@ class PaddleEngine:
 
         torch.set_num_threads(min(4, os.cpu_count() or 1))
         torch.set_num_interop_threads(1)
-        self.ocr = OCRRecognizer()
+        self.ocr = PaddleOCRRecognizer()
 
     def locate(self, image: Image.Image) -> list[Line]:
         scale = min(1, 864 / image.width)
@@ -127,23 +127,69 @@ class PaddleEngine:
         pass
 
 
-def open_engine(backend: str) -> WindowsOCR | PaddleEngine:
+class RapidEngine:
+    """使用 PP-OCRv5 mobile 的 OpenVINO CPU 推理。"""
+
+    def __init__(self) -> None:
+        self.ocr = OCRRecognizer()
+
+    def locate(self, image: Image.Image) -> list[Line]:
+        return self.ocr.locate_text(np.asarray(image))
+
+    def close(self) -> None:
+        pass
+
+
+class HybridEngine(WindowsOCR):
+    """先用 Windows OCR；按需提供 PP-OCRv5 mobile 二次意见。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._secondary: RapidEngine | None = None
+
+    def locate_secondary(self, image: Image.Image) -> list[Line]:
+        if self._secondary is None:
+            self._secondary = RapidEngine()
+        return self._secondary.locate(image)
+
+    def close(self) -> None:
+        try:
+            if self._secondary is not None:
+                self._secondary.close()
+        finally:
+            super().close()
+
+
+def open_engine(backend: str) -> WindowsOCR | PaddleEngine | RapidEngine:
     """启动指定后端，或按平台选择可用的后端。"""
     start = monotonic()
-    if os.name == "nt" and backend in ("auto", "windows"):
+    if os.name == "nt" and backend in ("auto", "windows", "hybrid"):
         try:
-            engine = WindowsOCR()
+            engine = WindowsOCR() if backend == "windows" else HybridEngine()
         except OSError, RuntimeError:
             if backend == "windows":
                 raise
+            if backend == "hybrid":
+                raise
         else:
-            print(
-                f"OCR Windows zh-Hans-CN ready in {monotonic() - start:.2f}s",
-                flush=True,
+            description = (
+                "Windows zh-Hans-CN + PP-OCRv5 mobile second opinion"
+                if isinstance(engine, HybridEngine)
+                else "Windows zh-Hans-CN"
             )
+            print(f"OCR {description} ready in {monotonic() - start:.2f}s", flush=True)
             return engine
     if backend == "windows":
         raise RuntimeError("Windows OCR requires Windows and the zh-Hans-CN OCR pack")
+    if backend == "hybrid":
+        raise RuntimeError("Hybrid OCR requires Windows and the zh-Hans-CN OCR pack")
+    if backend == "rapid":
+        engine = RapidEngine()
+        print(
+            f"OCR PP-OCRv5 mobile/OpenVINO ready in {monotonic() - start:.2f}s",
+            flush=True,
+        )
+        return engine
     engine = PaddleEngine()
     print(f"OCR PP-OCRv6 Medium ready in {monotonic() - start:.2f}s", flush=True)
     return engine

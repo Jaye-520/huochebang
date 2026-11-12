@@ -1,18 +1,25 @@
 """从有序详情截图提取字段，并处理浮层遮挡。"""
 
 import re
+from decimal import Decimal
 
 import numpy as np
 from numpy.typing import NDArray
-from PIL import Image
+from PIL import Image, ImageOps
 
-from .engines import PaddleEngine, WindowsOCR
+from .engines import HybridEngine, PaddleEngine, RapidEngine, WindowsOCR
 from .vision import Line, normalize, rows
 
 _PRICE = re.compile(r"\d+(?:\.\d+)?元(?:[/／](?:吨|趟|车))?")
 _WEIGHT = re.compile(r"\d+(?:\.\d+)?(?:[-–~至、]\d+(?:\.\d+)?)?吨")
 _COUNT = re.compile(r"(?:还需|需要车数[:：]?)?(\d+)辆")
 _BLOCK = re.compile(r"^(?:车辆|货物|需要车数|运费|订金|净得运费|实付技术服务费)")
+_PACKAGING = re.compile(r"[,(]?(吨袋|吨包|袋装|散装|裸装|捆扎|纸箱|筐装|托盘|其他)\)?$")
+_RATING = re.compile(
+    r"结算([0-5](?:\.\d+)?)爽约([0-5](?:\.\d+)?)评价([0-5](?:\.\d+)?)$"
+)
+_MILEAGE = re.compile(r"(?<![\w.])\d[\dOo]*(?:\.[\dOo]+)?km", re.I)
+_NET_RECHECK = "净得运费局部复读:"
 
 
 def detail_confirmed(lines: list[Line]) -> bool:
@@ -45,7 +52,10 @@ def detail_control(lines: list[Line]) -> tuple[str, Line] | None:
 
 
 def recognize_detail(
-    engine: WindowsOCR | PaddleEngine, image: Image.Image, *, first: bool
+    engine: HybridEngine | WindowsOCR | PaddleEngine | RapidEngine,
+    image: Image.Image,
+    *,
+    first: bool,
 ) -> list[Line]:
     if not isinstance(engine, WindowsOCR):
         return engine.locate(image)
@@ -98,6 +108,20 @@ def recognize_detail(
                 address = engine.locate(
                     prepared.crop((left, top - 6, image.width, end))
                 )
+                offset_x, offset_y = left, top - 6
+                if not address:
+                    address = [
+                        line
+                        for line in lines
+                        if line[1] >= left
+                        and top - 15 <= (line[2] + line[4]) / 2 <= bottom + 15
+                        and not normalize(line[0]).startswith(("装:", "卸:"))
+                        and any(
+                            marker in normalize(line[0])
+                            for marker in ("市", "县", "区", "州", "旗")
+                        )
+                    ]
+                    offset_x = offset_y = 0
                 if address:
                     value = "".join(
                         row
@@ -116,10 +140,43 @@ def recognize_detail(
                             label + ":" + value,
                             left,
                             top,
-                            left + max(line[3] for line in address),
-                            top - 6 + max(line[4] for line in address),
+                            offset_x + max(line[3] for line in address),
+                            offset_y + max(line[4] for line in address),
                         )
                     )
+    # 触控轨迹可能穿过金额首位，保留原识别并用较深阈值复读金额。
+    for label, x, y, right, bottom in lines:
+        if normalize(label) != "净得运费" or x > image.width * 0.16:
+            continue
+        if not any(
+            right - 10 <= left < image.width * 0.48
+            and top <= bottom
+            and lower >= y
+            and re.fullmatch(r"\d+(?:\.\d+)?元", normalize(value))
+            for value, left, top, _, lower in lines
+        ):
+            continue
+        left = right - 5
+        end = int(image.width * 0.51)
+        if end <= left:
+            continue
+        crop = pixels[max(0, y - 36) : bottom + 10, left:end]
+        ink = np.where(np.median(crop, axis=2) < 75, 0, 255).astype(np.uint8)
+        prepared_crop = ImageOps.expand(
+            Image.fromarray(ink).convert("RGB"), border=10, fill="white"
+        )
+        amounts = {
+            match[1] + "元"
+            for value, *_ in engine.locate(prepared_crop)
+            if (
+                match := re.fullmatch(
+                    r"[《¥￥]?(\d{2,}(?:\.\d+)?)(?:元[oO]?)?", normalize(value)
+                )
+            )
+        }
+        if len(amounts) == 1:
+            lines.append((_NET_RECHECK + next(iter(amounts)), left, y, end, bottom))
+        break
     return lines
 
 
@@ -139,8 +196,11 @@ def extract_fields(
     displayed_total = None
     money_with_unit = set()
     negotiable = False
+    listed_ranges = re.findall(r"\d+(?:\.\d+)?-\d+(?:\.\d+)?吨", card_key)
     for index, lines in enumerate(pages):
-        page_rows = rows(lines)
+        page_rows = rows(
+            [line for line in lines if not line[0].startswith(_NET_RECHECK)]
+        )
         compact = [normalize(row) for row in page_rows]
         for number, text in enumerate(compact):
             text = text.replace("货源反馈", "")
@@ -174,14 +234,11 @@ def extract_fields(
                         (y - top, match[0])
                         for value, left, top, _, _ in lines
                         if x - 45 <= left and 0 <= y - top <= 140
-                        if (
-                            match := re.search(
-                                r"\d+(?:\.\d+)?km", normalize(value), re.I
-                            )
-                        )
+                        if (match := _MILEAGE.search(normalize(value)))
                     ]
                     if candidates:
-                        fields.setdefault("estimated_distance", min(candidates)[1])
+                        distance = min(candidates)[1].lower().replace("o", "0")
+                        fields.setdefault("estimated_distance", distance)
             if all(label in text for label in ("结算", "爽约", "评价")):
                 rating = next((line for line in lines if "结算" in line[0]), None)
                 if rating:
@@ -197,9 +254,15 @@ def extract_fields(
                         fields.setdefault("shipper", min(names)[1])
             if text.startswith("车辆") and len(text) > 2:
                 value = text[2:]
-                if value.endswith("/") and number + 1 < len(compact):
+                if number + 1 < len(compact):
                     extra = compact[number + 1]
-                    if extra in ("飞翼车", "平板", "高栏", "高低板", "厢式", "冷藏"):
+                    if (
+                        value.endswith("/")
+                        and extra
+                        in ("飞翼车", "平板", "高栏", "高低板", "厢式", "冷藏")
+                        or value.endswith("高低")
+                        and extra == "板"
+                    ):
                         value += extra
                 if value.startswith(fields.get("vehicle", "")):
                     fields["vehicle"] = value
@@ -211,6 +274,12 @@ def extract_fields(
                 below_vehicle and _WEIGHT.search(text) and "元" not in text
             ):
                 value = text.removeprefix("货物")
+                for listed_range in listed_ranges:
+                    value = re.sub(
+                        rf"(?<![\d.]){re.escape(listed_range.replace('-', '.'))}",
+                        listed_range,
+                        value,
+                    )
                 if match := _WEIGHT.search(value):
                     fields.setdefault("weight", match[0].replace("、", "-"))
                     cargo = (
@@ -253,14 +322,227 @@ def extract_fields(
         fields.setdefault("price", "电议")
     elif list_price:
         fields.setdefault("price", list_price)
-    # 列表确认同一组数字为区间时，才修正详情中的小数点误读。
-    weight = fields.get("weight", "")
-    if re.fullmatch(r"\d+\.\d+吨", weight):
-        listed_ranges = re.findall(r"\d+(?:\.\d+)?-\d+(?:\.\d+)?吨", card_key)
-        corrected = weight.replace(".", "-")
-        if corrected in listed_ranges:
-            fields["weight"] = corrected
     return fields
+
+
+def clean_freight(
+    pages: list[list[Line]], fields: dict[str, str], review: set[str], card_key: str
+) -> None:
+    """整理人工表字段。保留 OCR 原文，疑义留给复核。"""
+    text = [
+        normalize(row)
+        for page in pages
+        for row in rows([line for line in page if not line[0].startswith(_NET_RECHECK)])
+    ]
+    for key in ("loading_location", "unloading_location"):
+        if address := fields.get(key):
+            address = re.sub(r"(?<=[\u4e00-\u9fff])[Oo○]$", "", address)
+            address = re.sub(r"(?<!\d)[.·、。]+|[.·、。]+(?!\d)", "-", address)
+            fields[key] = address.strip("-")
+            if re.search(r"[，,丿“”]|[\u4e00-\u9fff][Oo0]$", address):
+                review.add(key)
+
+    details = []
+    volume = None
+    if cargo := fields.get("cargo"):
+        if delivery := re.search(r"(卸(?:货地:?)?个人货场)$", cargo):
+            details.append(delivery[1])
+            cargo = cargo[: delivery.start()]
+        if packaging := _PACKAGING.search(cargo):
+            cargo = cargo[: packaging.start()].rstrip(",")
+        if "weight" in fields and (size := re.search(r"(\d+(?:-\d+)?方)$", cargo)):
+            volume = size[1]
+            cargo = cargo[: size.start()]
+        if "总重量" in cargo:
+            review.update(("cargo", "weight"))
+        if cargo:
+            fields["cargo"] = cargo
+        else:
+            fields.pop("cargo")
+    else:
+        packaging = None
+
+    if weight := fields.get("weight"):
+        if re.fullmatch(r"[1-9]\d+\.[1-9]\d+吨", weight):
+            review.add("weight")
+        variants = {weight, weight.replace("-", ".")}
+        total = any("总重量" + value in row for value in variants for row in text)
+        fields["weight"] = " ".join(
+            part
+            for part in (
+                ("总重" if total else "") + weight,
+                volume,
+                packaging[1] if packaging else None,
+            )
+            if part
+        )
+
+    if vehicle := fields.get("vehicle"):
+        fields["vehicle"] = vehicle.removeprefix("整车")
+        fields["vehicle"] = re.sub(
+            r"(?<=米)(?=[\u4e00-\u9fff])", " ", fields["vehicle"], count=1
+        )
+        if fields["vehicle"].endswith(("/", "高低")):
+            review.add("vehicle")
+    if fields.get("truck_count", "").isdigit():
+        fields["truck_count"] = f"还需{fields['truck_count']}辆"
+    elif "truck_count" not in fields and any("需要车数" in row for row in text):
+        review.add("truck_count")
+
+    rates = {
+        match[0]
+        for row in text
+        if not row.startswith(("订金", "实付", "信息费"))
+        for match in _PRICE.finditer(row)
+        if "/" in match[0]
+    }
+    net = {
+        match[1]
+        for row in text
+        if row.startswith(("净得运费", "预计净得运费"))
+        and (
+            match := re.match(
+                r"(?:预计)?净得运费:?[¥￥]?(\d+(?:\.\d+)?元)(?![\d.*/])", row
+            )
+        )
+        and not re.search(r"\d\*", row)
+    }
+    corroborated = {
+        amount for amount in net if any(rate.split("/")[0] == amount for rate in rates)
+    }
+    detail_totals = {
+        match[0]
+        for row in text
+        if (row.startswith("总运费") or re.match(r"^灬费\d", row))
+        and (match := _PRICE.search(row))
+    }
+    listed_price = card_key.rsplit("|", 1)[-1]
+    if re.fullmatch(r"\d+(?:\.\d+)?元", listed_price) and not corroborated:
+        truncated = {
+            amount
+            for amount in net
+            if amount != listed_price and listed_price.endswith(amount)
+        }
+        if truncated:
+            net -= truncated
+            fees = {
+                Decimal(match[0].removesuffix("元"))
+                for row in text
+                if row.startswith("信息费")
+                and (match := re.search(r"\d+(?:\.\d+)?元", row))
+            }
+            listed_amount = Decimal(listed_price.removesuffix("元"))
+            totals = {Decimal(rate.split("元")[0]) for rate in detail_totals}
+            rechecked = any(
+                value == _NET_RECHECK + listed_price
+                for page in pages
+                for value, *_ in page
+            )
+            if len(totals) == 1 and (
+                listed_amount in totals
+                or rechecked
+                and listed_amount <= next(iter(totals))
+                or len(fees) == 1
+                and listed_amount + next(iter(fees)) in totals
+            ):
+                net.add(listed_price)
+            else:
+                review.add("price")
+    if corroborated:
+        net = corroborated
+    if fields.get("price") == "电议":
+        fields["price"] = "请先与货主协商(净得运费)"
+    elif any(row.startswith(("运费:在线沟通", "运费在线沟通")) for row in text):
+        fields["price"] = "在线沟通"
+    elif len(net) == 1:
+        amount = next(iter(net))
+        totals = detail_totals.copy()
+        totals.update(rate for rate in rates if rate.split("/")[0] == amount)
+        # 同额时优先保留有单位的读数。
+        totals = {total for total in totals if total + "/趟" not in totals}
+        rate = next(iter(totals)) if len(totals) == 1 else None
+        if len(totals) > 1:
+            review.add("price")
+        fields["price"] = f"净得{amount}(总运费{rate})" if rate else f"净得{amount}"
+    elif len(net) > 1:
+        review.add("price")
+    elif "price" not in fields and len(rates) == 1:
+        fields["price"] = next(iter(rates))
+    elif "price" not in fields and listed_price:
+        # 无单位的列表金额仍有证据，保留金额并提示核对单位。
+        if re.fullmatch(r"\d+(?:\.\d+)?元", listed_price):
+            fields["price"] = listed_price
+            review.add("price")
+
+    loading_time = None
+    loading_time_reviewed = False
+    reviewed_before_time = "other_info" in review
+    loading_start_hour = None
+    if pages:
+        for line, x, y, _, _ in pages[0]:
+            if x > 160 or y > 180:
+                continue
+            line = normalize(line).replace("裝", "装")
+            if re.match(r"^(今天|明天|后天|今明|装货时间)", line):
+                line = re.split(
+                    r"\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)*米", line, maxsplit=1
+                )[0]
+                line = re.sub(r"(?<=\d{2}:\d{2})[.·](?=\d{1,2}:\d{2})", "-", line)
+                # OCR 偶尔把时间范围的短横线和下一小时的「1」合并识别为「刁」。
+                line = re.sub(r"(\d{1,2}:\d{2})刁(?=\d:\d{2})", r"\1-1", line)
+                if re.search(r"[亿刁]|\d{1,2}:\d{2}[.·]", line):
+                    review.add("other_info")
+                    loading_time_reviewed = True
+                    if start := re.search(r"(\d{1,2}):\d{2}", line):
+                        loading_start_hour = int(start[1])
+                elif re.search(r"装货|可装|\d{1,2}:\d{2}", line):
+                    loading_time = line.replace(",", "，").strip("，")
+                    break
+    if loading_time is None and (
+        listed_time := re.search(
+            r"(?:今天或明天|今明均|今天|明天|后天|明(?=\d))"
+            r"(?:\d{1,2}(?::\d{2})?(?:-\d{1,2}(?::\d{2})?)?点?(?:前)?)?"
+            r"(?:可装|装货)",
+            card_key,
+        )
+    ):
+        loading_time = listed_time[0]
+        if loading_time.startswith("明") and not loading_time.startswith("明天"):
+            loading_time = "明天" + loading_time[1:]
+        listed_start = re.match(r"明(?:天)?(\d{1,2})", loading_time)
+        if (
+            loading_time_reviewed
+            and not reviewed_before_time
+            and listed_start
+            and loading_start_hour == int(listed_start[1])
+        ):
+            review.discard("other_info")
+    if loading_time:
+        details.insert(0, loading_time)
+    if note := fields.get("other_info"):
+        details.append(re.sub(r"[,，]+", "，", note).strip("，；"))
+    ratings = {match.groups() for row in text if (match := _RATING.search(row))}
+    if len(ratings) == 1:
+        settlement, cancellation, rating = next(iter(ratings))
+        details.append(f"结算{settlement}/爽约{cancellation}/评价{rating}")
+    elif len(ratings) > 1:
+        review.add("other_info")
+    if details:
+        fields["other_info"] = "；".join(dict.fromkeys(filter(None, details)))
+    review.update(
+        key
+        for key in (
+            "shipper",
+            "loading_location",
+            "unloading_location",
+            "cargo",
+            "weight",
+            "estimated_distance",
+            "vehicle",
+            "price",
+        )
+        if not fields.get(key)
+    )
 
 
 _FIELD_LABELS = {

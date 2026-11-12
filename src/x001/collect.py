@@ -13,13 +13,14 @@ from pathlib import Path
 from subprocess import SubprocessError
 from tempfile import gettempdir
 from time import monotonic, sleep
-from typing import Literal
+from typing import Literal, TypedDict
 
 from uiautomator2.exceptions import BaseException as UiAutomatorError
 
 from .adb import ADBController
-from .engines import PaddleEngine, WindowsOCR, open_engine
+from .engines import HybridEngine, PaddleEngine, RapidEngine, WindowsOCR, open_engine
 from .freight import (
+    clean_freight,
     detail_confirmed,
     detail_control,
     extract_fields,
@@ -34,6 +35,7 @@ from .vision import (
     Viewport,
     decode,
     detail_area,
+    detail_loading,
     list_area,
     list_body,
     match_cards,
@@ -41,14 +43,36 @@ from .vision import (
     visual_progress,
 )
 
-_RECOMMENDATION_LIMIT = 3
 _OCR_RESPONSE_TIMEOUT = 600
+_LIST_READ_ATTEMPTS = 6
+_SECOND_OPINION_ENGINE = "RapidOCR PP-OCRv5 mobile/OpenVINO"
 
 type _CachedPage = tuple[list[Line], int, float]
+_SECOND_OPINION_FIELDS = {"weight", "other_info"}
+
+
+class _SecondOpinionBase(TypedDict):
+    engine: str
+    target_fields: list[str]
+    fields: dict[str, str]
+
+
+class _SecondOpinion(_SecondOpinionBase):
+    review_fields: list[str]
+    seconds: float
+    raw_pages: list[list[Line]]
+
+
+class _SecondOpinionFailure(_SecondOpinionBase):
+    error: str
+
+
+class _RouteListError(RuntimeError):
+    """返回或滚动后未能确认原线路。"""
 
 
 def _recognize_group(
-    engine: WindowsOCR | PaddleEngine,
+    engine: HybridEngine | WindowsOCR | PaddleEngine | RapidEngine,
     store: Store,
     task: sqlite3.Row,
     cached: dict[int, _CachedPage],
@@ -78,11 +102,83 @@ def _recognize_group(
         fields, review = resolve_feedback(
             pages, widths, task["list_price"], task["card_key"]
         )
-        store.complete(capture_id, pages, fields, seconds, review)
+        clean_freight(pages, fields, review, task["card_key"])
+        if "truck_count" not in fields and detail_loading(
+            decode((store.root / paths[-1]).read_bytes())
+        ):
+            review.add("truck_count")
+        second_opinion: _SecondOpinion | _SecondOpinionFailure | None = None
+        if isinstance(engine, HybridEngine):
+            targets = review & _SECOND_OPINION_FIELDS
+            if not fields.get("weight"):
+                targets.add("weight")
+            if targets:
+                start = monotonic()
+                try:
+                    second_opinion = _second_opinion(
+                        engine,
+                        store,
+                        paths,
+                        targets,
+                        task["list_price"],
+                        task["card_key"],
+                    )
+                except Exception as error:
+                    seconds += monotonic() - start
+                    second_opinion = {
+                        "engine": _SECOND_OPINION_ENGINE,
+                        "target_fields": sorted(targets),
+                        "fields": {},
+                        "error": str(error),
+                    }
+                    print(
+                        f"#{capture_id} PP-OCRv5 second opinion failed "
+                        f"(not applied): {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    seconds += second_opinion["seconds"]
+                    print(
+                        f"#{capture_id} PP-OCRv5 second opinion "
+                        f"(not applied): {second_opinion['fields']}",
+                        flush=True,
+                    )
+        store.complete(
+            capture_id, pages, fields, seconds, review, second_opinion=second_opinion
+        )
         print(f"#{capture_id} OCR {seconds:.2f}s, {len(fields)}/10 fields", flush=True)
     except Exception as error:
         store.ocr_failed(capture_id, str(error))
         print(f"#{capture_id} OCR failed: {error}", file=sys.stderr, flush=True)
+
+
+def _second_opinion(
+    engine: HybridEngine,
+    store: Store,
+    paths: list[str],
+    targets: set[str],
+    list_price: str | None,
+    card_key: str,
+) -> _SecondOpinion:
+    pages = []
+    widths = []
+    start = monotonic()
+    for index, screenshot in enumerate(paths):
+        image = decode((store.root / screenshot).read_bytes())
+        first = index == 0
+        pages.append(engine.locate_secondary(detail_area(image, first=first)))
+        widths.append(image.width)
+    fields, review = resolve_feedback(pages, widths, list_price, card_key)
+    clean_freight(pages, fields, review, card_key)
+    return {
+        "engine": _SECOND_OPINION_ENGINE,
+        "target_fields": sorted(targets),
+        "fields": {key: fields[key] for key in sorted(targets) if key in fields},
+        "review_fields": sorted(review),
+        "seconds": monotonic() - start,
+        "raw_pages": pages,
+    }
 
 
 def _worker(path: Path, backend: str, connection: Connection) -> None:
@@ -239,27 +335,93 @@ class Collector:
         png = self.device.screenshot()
         return png, read_viewport(decode(png), self.worker.request("list", png))
 
-    def _return_and_refresh(self, route: str, png: bytes, view: Viewport) -> str:
-        # 回到顶部后，同一个下滑手势会触发下拉刷新。
+    def _wait_for_list(
+        self, route: str = "", *, recover_detail: bool = False
+    ) -> tuple[bytes, Viewport]:
+        dismissed_voice = False
+        back_taps = 0
+        for attempt in range(_LIST_READ_ATTEMPTS):
+            png, view = self._read_list()
+            if recover_detail and view.voice_cancel is not None:
+                if not dismissed_voice:
+                    print("Dismissing system voice prompt", flush=True)
+                    self.device.tap(*view.voice_cancel)
+                    dismissed_voice = True
+            elif view.is_list and view.route and (not route or view.route == route):
+                return png, view
+            elif (
+                recover_detail
+                and back_taps < 2
+                and view.detail_back is not None
+                and (dismissed_voice or attempt >= 2 + 2 * back_taps)
+            ):
+                print(
+                    "Returning with the freight detail back button "
+                    f"(attempt {back_taps + 1})",
+                    flush=True,
+                )
+                self.device.tap(*view.detail_back)
+                back_taps += 1
+            if attempt + 1 < _LIST_READ_ATTEMPTS:
+                sleep(0.8)
+        raise _RouteListError(
+            f"Could not confirm the freight route list after {_LIST_READ_ATTEMPTS} "
+            f"checks (expected={route!r}, last OCR route={view.route!r}, "
+            f"list controls detected={view.is_list})"
+        )
+
+    def _expand_fold(self, route: str, position: tuple[int, int]) -> None:
+        x, y = position
+        print(f"Tapping folded group at ({x}, {y})", flush=True)
+        self.device.tap(x, y)
+        for _ in range(_LIST_READ_ATTEMPTS):
+            sleep(0.65)
+            try:
+                _, view = self._wait_for_list(route)
+            except _RouteListError as error:
+                raise _RouteListError(
+                    f"After tapping the folded group at ({x}, {y}): {error}"
+                ) from error
+            # 等原入口离开该位置，期间不重复点击，避免点到展开后的货源。
+            if all(abs(other_y - y) > 40 for _, other_y in view.folds):
+                print("Expanded a folded group", flush=True)
+                return
+        raise RuntimeError(f"The folded group at ({x}, {y}) did not expand")
+
+    def _wait_for_refresh(self, route: str) -> str | None:
+        for _ in range(_LIST_READ_ATTEMPTS):
+            sleep(0.8)
+            try:
+                _, view = self._wait_for_list(route)
+            except _RouteListError as error:
+                return str(error)
+            if not view.refreshing:
+                return None
+        return "refresh indicator remained active"
+
+    def _return_and_refresh(self, route: str, png: bytes, view: Viewport) -> str | None:
         for _ in range(40):
             self.worker.check()
             before = decode(png)
             width, height = before.size
+            region = (
+                width // 4,
+                int(height * 0.34),
+                width // 4,
+                int(height * 0.86),
+            )
             self.device.scroll(
                 "down",
-                region=(width // 4, int(height * 0.34), width // 4, int(height * 0.86)),
+                region=region,
                 duration_ms=530,
             )
             sleep(0.7)
-            for _ in range(3):
-                png, after = self._read_list()
-                if after.is_list and after.route == route:
-                    break
-                sleep(0.45)
-            else:
-                return (
-                    "stopped returning because the route screen could not be confirmed"
-                )
+            try:
+                png, after = self._wait_for_list(route)
+            except _RouteListError as error:
+                return str(error)
+            if after.refreshing:
+                return self._wait_for_refresh(route)
 
             anchors = {card.key: card.y for card in view.cards}
             shared = [
@@ -272,24 +434,44 @@ class Collector:
                 and all(abs(delta) <= 18 for delta in shared)
                 or not visual_progress(list_body(before), list_body(decode(png)))
             )
-            if after.refreshing or stationary:
-                return "reached the top and issued the pull-to-refresh gesture"
+            if stationary:
+                print("Reached the top; pulling down to refresh", flush=True)
+                self.device.scroll(
+                    "down",
+                    distance=int(height * 0.25),
+                    region=region,
+                    duration_ms=530,
+                )
+                sleep(0.7)
+                try:
+                    _, refreshed = self._wait_for_list(route)
+                except _RouteListError as error:
+                    return str(error)
+                if refreshed.refreshing:
+                    return self._wait_for_refresh(route)
+                return None
             view = after
         return "could not confirm the top within 40 return gestures"
 
-    def _capture_detail(self, card: Card, png: bytes) -> int:
-        capture_id = self.store.begin(card.key, card.price)
+    def _capture_detail(self, card: Card, png: bytes, route: str | None = None) -> int:
+        capture_id = self.store.begin(card.key, card.price, route)
         paths = []
         try:
             directory = self.store.folder(capture_id)
             directory.mkdir(parents=True, exist_ok=True)
             paths.append(_save(directory / "card.png", png))
+            print(
+                f"#{capture_id} opening card at ({card.x}, {card.y}): {card.key}",
+                flush=True,
+            )
             self.device.tap(card.x, card.y)
             sleep(1.6)
             previous = None
             handled = set()
-            for _ in range(6):
+            loading = False
+            for _ in range(10):
                 first_png = self.device.screenshot()
+                first_image = decode(first_png)
                 paths_for_first = _save(directory / "detail-01.png", first_png)
                 if len(paths) == 1:
                     paths.append(paths_for_first)
@@ -298,22 +480,34 @@ class Collector:
                 if control is not None and control[0] not in handled:
                     name, (_, x, y, right, bottom) = control
                     handled.add(name)
-                    height = decode(first_png).height
+                    height = first_image.height
+                    print(f"#{capture_id} tapping detail control: {name}", flush=True)
                     self.device.tap(
                         (x + right) // 2, (y + bottom) // 2 + int(height * 0.10)
                     )
                     sleep(0.75)
                     continue
-                if detail_confirmed(lines):
-                    previous = detail_area(decode(first_png), first=False)
+                if detail_loading(first_image):
+                    if not loading:
+                        print(f"#{capture_id} waiting for detail to load", flush=True)
+                    loading = True
+                elif detail_confirmed(lines):
+                    previous = detail_area(first_image, first=False)
                     break
                 sleep(0.65)
             if previous is None:
+                if loading and detail_confirmed(lines):
+                    print(
+                        f"#{capture_id} detail still loading; keeping visible fields",
+                        flush=True,
+                    )
+                    self._finish_detail(capture_id, paths)
+                    return capture_id
                 raise RuntimeError(
-                    "Detail page could not be confirmed; check the phone"
+                    "Detail page did not finish loading or could not be confirmed"
                 )
 
-            width, height = decode(first_png).size
+            width, height = first_image.size
             covered = set()
             supplements = 0
 
@@ -387,13 +581,7 @@ class Collector:
                 previous = current
             else:
                 raise RuntimeError("Detail scrolling did not settle after eight swipes")
-            self.store.publish(capture_id, paths)
-            self.device.back()
-            sleep(0.65)
-            print(
-                f"#{capture_id} captured {len(paths) - 1} detail screenshots",
-                flush=True,
-            )
+            self._finish_detail(capture_id, paths)
             return capture_id
         except Exception as error:
             # 截图组已经提交时，返回列表失败也保留其待处理状态。
@@ -406,6 +594,15 @@ class Collector:
                 self.store.publish(capture_id, paths, str(error))
             raise
 
+    def _finish_detail(self, capture_id: int, paths: list[Path]) -> None:
+        self.store.publish(capture_id, paths)
+        self.device.back()
+        sleep(0.65)
+        print(
+            f"#{capture_id} captured {len(paths) - 1} detail screenshots",
+            flush=True,
+        )
+
     def run(self, maximum: int | None) -> str:
         old_cards: tuple[Card, ...] = ()
         visits: list[int | None] = []
@@ -416,20 +613,14 @@ class Collector:
         scroll = False
         stale = 0
         captured = 0
-        recommendations = 0
-        last_fold = None
+        captured_keys: set[str] = set()
+        route_announced = False
+        returning_from_detail = False
         while True:
             # 队列等待期间可能插入新货源，继续操作前重新识别当前列表。
             self._wait_for_capacity()
-            for _ in range(3):
-                png, view = self._read_list()
-                if view.is_list and view.route and (not route or route == view.route):
-                    break
-                sleep(0.45)
-            else:
-                raise RuntimeError(
-                    "Expected the original freight route list; check the phone"
-                )
+            png, view = self._wait_for_list(route, recover_detail=returning_from_detail)
+            returning_from_detail = False
             route = view.route
             image = decode(png)
             width, height = image.size
@@ -456,50 +647,51 @@ class Collector:
             old_cards, old_view = view.cards, view
             old_image = current_body
             scroll = False
+            if not route_announced and route:
+                print(f"Route: {route}", flush=True)
+                route_announced = True
             if view.folds:
-                fold = (tuple(card.key for card in view.cards), view.folds[0])
-                if fold == last_fold:
-                    raise RuntimeError(
-                        "The visible folded group did not expand; check the phone"
-                    )
-                last_fold = fold
-                recommendations = 0
-                self.device.tap(*view.folds[0])
-                print("Expanded a folded group", flush=True)
-                sleep(0.65)
+                self._expand_fold(route, view.folds[0])
                 continue
-            last_fold = None
-            pending = next((i for i, visit in enumerate(visits) if visit is None), None)
+            pending = next(
+                (
+                    i
+                    for i, (card, visit) in enumerate(
+                        zip(view.cards, visits, strict=True)
+                    )
+                    if not card.viewed
+                    and not card.recommended
+                    and visit is None
+                    and card.key not in captured_keys
+                ),
+                None,
+            )
             if pending is not None:
                 card = view.cards[pending]
-                visits[pending] = self._capture_detail(card, png)
+                visits[pending] = self._capture_detail(card, png, route)
+                captured_keys.add(card.key)
+                returning_from_detail = True
                 history.append((view.cards, visits.copy()))
                 captured += 1
-                recommendations = recommendations + 1 if card.recommended else 0
                 if maximum is not None and captured >= maximum:
                     return f"Stopped at the requested limit ({captured})"
-                if recommendations >= _RECOMMENDATION_LIMIT and all(
-                    candidate.recommended for candidate in view.cards[pending + 1 :]
-                ):
-                    current_png, current_view = self._read_list()
-                    if current_view.is_list and current_view.route == route:
-                        if current_view.folds or any(
-                            not candidate.recommended and visit is None
-                            for candidate, visit in zip(
-                                current_view.cards,
-                                match_cards(view.cards, visits, current_view.cards),
-                                strict=True,
-                            )
-                        ):
-                            continue
-                        result = self._return_and_refresh(
-                            route, current_png, current_view
-                        )
-                    else:
-                        result = (
-                            "could not confirm the route after returning from detail"
-                        )
-                    return f"Stopped after {recommendations} recommendations: {result}"
+                continue
+            if any(card.recommended for card in view.cards):
+                result = self._return_and_refresh(route, png, view)
+                if result is not None:
+                    return f"Stopped at the recommendation section: {result}"
+                print(
+                    "Refreshed after the recommendation section; restarting collection",
+                    flush=True,
+                )
+                old_cards = ()
+                visits = []
+                old_view = None
+                old_image = None
+                history.clear()
+                scroll = False
+                stale = 0
+                returning_from_detail = False
                 continue
             if view.end:
                 return f"Reached the list end ({captured} captures)"
@@ -537,24 +729,31 @@ def main() -> None:
     )
     parser.add_argument(
         "--ocr",
-        choices=("auto", "windows", "paddle"),
+        choices=("auto", "windows", "hybrid", "rapid", "paddle"),
         default="auto",
-        help="OCR 后端（默认 %(default)s）",
+        help="OCR 后端；auto 在 Windows 上启用字段级二次识别（默认 %(default)s）",
     )
     parser.add_argument(
         "--capacity", type=int, default=3, help="未完成截图组上限（默认 %(default)s）"
     )
     parser.add_argument("--max-orders", type=int, help="本轮最多采集的货源数")
-    parser.add_argument("--process-only", action="store_true", help="仅处理已有截图组")
+    processing = parser.add_mutually_exclusive_group()
+    processing.add_argument(
+        "--process-only", action="store_true", help="仅处理已有截图组"
+    )
+    processing.add_argument(
+        "--reprocess-all", action="store_true", help="用已有截图重做识别和清洗"
+    )
     args = parser.parse_args()
     if args.capacity < 1 or (args.max_orders is not None and args.max_orders < 1):
         parser.error("--capacity 和 --max-orders 必须为正整数")
 
     path = args.database.resolve()
+    process_only = args.process_only or args.reprocess_all
     try:
         device_lock = (
             nullcontext()
-            if args.process_only
+            if process_only
             else exclusive_run(Path(gettempdir()) / "x001-android-device")
         )
         with device_lock, exclusive_run(path):
@@ -562,6 +761,8 @@ def main() -> None:
             try:
                 store.initialize()
                 store.recover()
+                if args.reprocess_all:
+                    store.requeue_completed()
                 done_query = "SELECT count(*) FROM captures WHERE status='done'"
                 before = store.db.execute(done_query).fetchone()[0]
                 worker = Worker(path, args.ocr)
@@ -570,7 +771,7 @@ def main() -> None:
                     worker.receive()
                     start = monotonic()
                     failure = None
-                    if not args.process_only:
+                    if not process_only:
                         try:
                             print(
                                 Collector(

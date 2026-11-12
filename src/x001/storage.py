@@ -23,6 +23,18 @@ FIELDS = (
     "shipper",
     "cargo",
 )
+REPORT_FIELDS = {
+    "shipper": "货主",
+    "loading_location": "装货地",
+    "unloading_location": "卸货地",
+    "cargo": "货物",
+    "weight": "货物重量",
+    "estimated_distance": "预估里程",
+    "vehicle": "车型要求",
+    "truck_count": "需要车数",
+    "price": "运价",
+    "other_info": "其他信息",
+}
 
 
 @contextmanager
@@ -66,6 +78,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS captures (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    route TEXT,
                     card_key TEXT NOT NULL,
                     list_price TEXT,
                     screenshots TEXT,
@@ -78,9 +91,15 @@ class Store:
                     capture_id INTEGER PRIMARY KEY REFERENCES captures(id),
                     ocr_raw TEXT NOT NULL,
                     review_fields TEXT NOT NULL DEFAULT '[]',
+                    second_opinion TEXT,
                     {columns}
                 );
             """)
+            capture_columns = {
+                row["name"] for row in self.db.execute("PRAGMA table_info(captures)")
+            }
+            if "route" not in capture_columns:
+                self.db.execute("ALTER TABLE captures ADD COLUMN route TEXT")
             columns = {
                 row["name"] for row in self.db.execute("PRAGMA table_info(freight)")
             }
@@ -89,6 +108,25 @@ class Store:
                     "ALTER TABLE freight ADD COLUMN "
                     "review_fields TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "second_opinion" not in columns:
+                self.db.execute("ALTER TABLE freight ADD COLUMN second_opinion TEXT")
+            report_columns = []
+            for key, label in REPORT_FIELDS.items():
+                value = (
+                    "coalesce(truck_count, '未显示')" if key == "truck_count" else key
+                )
+                report_columns.append(
+                    f"""CASE WHEN instr(review_fields, '"{key}"') > 0
+                         THEN coalesce({key} || '（待核对）', '待核对')
+                         ELSE {value}
+                    END AS {label}"""
+                )
+            self.db.execute(f"""
+                CREATE VIEW IF NOT EXISTS freight_report AS
+                SELECT row_number() OVER (ORDER BY capture_id) AS 序号,
+                       {", ".join(report_columns)}
+                FROM freight
+                """)
 
     def recover(self) -> None:
         """恢复已保存的识别任务，标记未完成的采集。"""
@@ -111,14 +149,22 @@ class Store:
             WHERE status IN ('capturing','queued','processing')
         """).fetchone()[0]
 
-    def begin(self, key: str, price: str | None) -> int:
+    def requeue_completed(self) -> None:
+        """重新识别已保存的截图，成功时才覆盖上一版结果。"""
+        with self.db:
+            self.db.execute("""
+                UPDATE captures SET status='queued', error=NULL
+                WHERE status='done' AND screenshots IS NOT NULL
+                """)
+
+    def begin(self, key: str, price: str | None, route: str | None = None) -> int:
         with self.db:
             return self.db.execute(
                 """
-                INSERT INTO captures(card_key, list_price, status)
-                VALUES (?, ?, 'capturing')
+                INSERT INTO captures(card_key, list_price, route, status)
+                VALUES (?, ?, ?, 'capturing')
             """,
-                (key, price),
+                (key, price, route),
             ).lastrowid
 
     def folder(self, capture_id: int) -> Path:
@@ -153,9 +199,16 @@ class Store:
         fields: Mapping[str, str],
         seconds: float,
         review_fields: Iterable[str] = (),
+        second_opinion: Mapping[str, object] | None = None,
     ) -> None:
         """在同一事务中写入货源结果并完成对应的识别任务。"""
-        columns = ("capture_id", "ocr_raw", "review_fields", *FIELDS)
+        columns = (
+            "capture_id",
+            "ocr_raw",
+            "review_fields",
+            "second_opinion",
+            *FIELDS,
+        )
         placeholders = ", ".join("?" for _ in columns)
         updates = ", ".join(f"{key}=excluded.{key}" for key in columns[1:])
         with self.db:
@@ -168,6 +221,11 @@ class Store:
                     capture_id,
                     json.dumps(raw, ensure_ascii=False),
                     json.dumps(sorted(review_fields)),
+                    (
+                        json.dumps(second_opinion, ensure_ascii=False)
+                        if second_opinion is not None
+                        else None
+                    ),
                     *(fields.get(key) for key in FIELDS),
                 ),
             )

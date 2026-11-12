@@ -8,18 +8,115 @@ from unittest.mock import Mock, patch
 
 from PIL import Image, ImageDraw
 
-from x001.collect import Collector, _save, main
+from x001.collect import Collector, _recognize_group, _save, _second_opinion, main
+from x001.engines import HybridEngine, WindowsOCR
 from x001.freight import (
+    clean_freight,
     detail_control,
     extract_fields,
     feedback_blocked,
+    recognize_detail,
     resolve_feedback,
 )
 from x001.storage import Store
-from x001.vision import Card, Viewport, match_cards, read_viewport
+from x001.vision import (
+    Card,
+    Viewport,
+    _body_ink,
+    _viewed_title,
+    match_cards,
+    read_viewport,
+)
 
 
 class MatchingTests(unittest.TestCase):
+    def test_viewed_title_accepts_gray_during_return_animation(self):
+        import numpy as np
+
+        image = Image.new("RGB", (200, 40), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((10, 10, 120, 30), fill=(164, 164, 164))
+        self.assertTrue(_viewed_title(np.asarray(image)))
+        draw.rectangle((10, 10, 120, 30), fill=(27, 27, 27))
+        self.assertFalse(_viewed_title(np.asarray(image)))
+
+    def test_body_ink_survives_card_top_clipped_by_header(self):
+        image = Image.new("RGB", (1080, 2340), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((38, 586, 240, 611), fill=163)
+        draw.rectangle((38, 680, 370, 712), fill=194)
+        full = _body_ink(image, 500, 896, viewed=True)
+        clipped = _body_ink(image, 570, 896, viewed=True)
+        self.assertTrue(full)
+        self.assertEqual(full, clipped)
+
+    def test_scroll_matches_clipped_card_using_its_visible_body(self):
+        old = Card(
+            "吴忠盐池邢台隆尧13米高栏34吨石膏散装今天装货|电议",
+            270,
+            1654,
+            None,
+            body_ink=b"\x19" * 768,
+            tail_ink=b"\x17" * 768,
+        )
+        clipped = Card(
+            "吴思盐旭邢冒陲尧13米高栏34吨石膏散装今天装货|电议",
+            270,
+            566,
+            None,
+            body_ink=b"\x99" * 768,
+            viewed=True,
+            clipped=True,
+            tail_ink=old.tail_ink,
+        )
+        self.assertEqual(match_cards((old,), [7], (clipped,), scroll=True), [7])
+
+    def test_list_requires_right_side_controls_after_return(self):
+        image = Image.new("RGB", (1080, 2340), "white")
+        left = [
+            ("宁夏乛河北", 390, 35, 660, 68),
+            ("已订阅", 37, 135, 180, 170),
+            ("未开启听单", 145, 248, 330, 285),
+        ]
+        right = [
+            ("设置", 965, 41, 1040, 72),
+            ("筛选", 917, 250, 1030, 288),
+        ]
+        partial = read_viewport(image, left)
+        self.assertEqual(partial.route, "宁夏河北")
+        self.assertFalse(partial.is_list)
+        self.assertTrue(read_viewport(image, left + right).is_list)
+
+    def test_visited_card_matches_after_fade_shift_and_ocr_changes(self):
+        def body(color, offset=0, *, changed=False):
+            image = Image.new("RGB", (1080, 2340), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((1, 580, 14, 598), fill="red")
+            draw.rectangle((38 + offset, 584, 240 + offset, 612), fill=color)
+            draw.rectangle(
+                (38 + offset, 685, (155 if changed else 370) + offset, 717),
+                fill=color,
+            )
+            return _body_ink(image, 546, 896, viewed=color == 163)
+
+        price_ink = b"\x17" * 384
+        old = Card(
+            "固原原州13米高栏35吨杏核|8800元", 270, 598, None, price_ink, body(26)
+        )
+        same = Card(
+            "固原原州0到3吨杏核|8800元", 270, 598, None, price_ink, body(163, 6)
+        )
+        changed = Card(
+            "固原原州后天装货|8800元",
+            270,
+            598,
+            None,
+            price_ink,
+            body(163, 6, changed=True),
+        )
+        self.assertEqual(match_cards((old,), [7], (same,)), [7])
+        self.assertEqual(match_cards((old,), [7], (changed,)), [None])
+
     def test_ocr_variation_at_scroll_overlap_uses_card_pixels(self):
         price_ink = b"\x17" * 384
         body_ink = b"\x19" * 768
@@ -35,6 +132,32 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(
             match_cards((old,), [7], (same, other), scroll=True), [7, None]
         )
+
+    def test_negotiable_price_matches_stable_pixels_despite_ocr_number_change(self):
+        body_ink = b"\x19" * 768
+        old = Card(
+            "固原原州13/13.7米90吨今天15点前装货|电议",
+            270,
+            598,
+            None,
+            body_ink=body_ink,
+        )
+        same = Card(
+            "固原原州0到13/13.7米90吨今天15点前装货|电议",
+            270,
+            598,
+            None,
+            body_ink=body_ink,
+        )
+        other = Card(
+            "固原原州13/13.7米90吨明天15点前装货|电议",
+            270,
+            598,
+            None,
+            body_ink=b"\x99" * 768,
+        )
+        self.assertEqual(match_cards((old,), [7], (same,)), [7])
+        self.assertEqual(match_cards((old,), [7], (other,)), [None])
 
     def test_overlap_skips_captured_card_but_preserves_changed_time_or_price(self):
         old = (
@@ -52,6 +175,19 @@ class MatchingTests(unittest.TestCase):
         card = Card("同一摘要|280元/吨", 270, 800, None)
         self.assertEqual(match_cards((card,), [8], (card, card)), [None, None])
 
+    def test_gray_title_recovers_displaced_card_from_this_round(self):
+        body_ink = b"\x19" * 768
+        key = "固原原州今天装货|电议"
+        captured = Card(key, 270, 600, None, body_ink=body_ink)
+        gray = Card(key, 270, 1200, None, body_ink=body_ink, viewed=True)
+        dark = Card(key, 270, 1200, None, body_ink=body_ink)
+        self.assertEqual(match_cards((captured,), [7], (gray,), historical=True), [7])
+        self.assertEqual(
+            match_cards((captured,), [7], (dark,), historical=True), [None]
+        )
+        self.assertEqual(match_cards((captured,), [None], (gray,)), [None])
+        self.assertEqual(match_cards((captured,), [7], (gray, gray)), [None, None])
+
     def test_reorder_with_stationary_card_and_new_recommendation(self):
         a = Card("一|200元/吨", 270, 700, None)
         b = Card("二|300元/吨", 270, 1000, None)
@@ -60,6 +196,21 @@ class MatchingTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
+    def test_existing_database_adds_route_column_and_keeps_capture_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "test.sqlite3")
+            try:
+                store.initialize()
+                capture_id = store.begin("a", None, "宁夏河北")
+                store.db.execute("ALTER TABLE captures DROP COLUMN route")
+                store.initialize()
+                row = store.db.execute(
+                    "SELECT card_key, route FROM captures WHERE id=?", (capture_id,)
+                ).fetchone()
+                self.assertEqual(tuple(row), ("a", None))
+            finally:
+                store.db.close()
+
     def test_failed_screenshot_write_preserves_previous_image(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "detail-01.png"
@@ -85,24 +236,33 @@ class StorageTests(unittest.TestCase):
                 store.initialize()
                 capture_id = store.begin("a", None)
                 store.complete(capture_id, [], {"vehicle": "整车13米"}, 0.2)
+                store.db.execute("DROP VIEW freight_report")
                 store.db.execute("ALTER TABLE freight DROP COLUMN review_fields")
+                store.db.execute("ALTER TABLE freight DROP COLUMN second_opinion")
                 store.initialize()
                 self.assertEqual(
                     tuple(
                         store.db.execute(
-                            "SELECT vehicle, review_fields FROM freight"
+                            "SELECT vehicle, review_fields, second_opinion FROM freight"
                         ).fetchone()
                     ),
-                    ("整车13米", "[]"),
+                    ("整车13米", "[]", None),
                 )
-                store.complete(capture_id, [], {}, 0.2, {"vehicle"})
+                opinion = {
+                    "engine": "RapidOCR PP-OCRv5 mobile/OpenVINO",
+                    "target_fields": ["weight"],
+                    "fields": {"weight": "33-35吨"},
+                }
+                store.complete(
+                    capture_id, [], {}, 0.2, {"vehicle"}, second_opinion=opinion
+                )
                 self.assertEqual(
                     tuple(
                         store.db.execute(
-                            "SELECT vehicle, review_fields FROM freight"
+                            "SELECT vehicle, review_fields, second_opinion FROM freight"
                         ).fetchone()
                     ),
-                    (None, '["vehicle"]'),
+                    (None, '["vehicle"]', json.dumps(opinion, ensure_ascii=False)),
                 )
             finally:
                 store.db.close()
@@ -150,6 +310,131 @@ class StorageTests(unittest.TestCase):
 
 class CollectorTests(unittest.TestCase):
     @patch("x001.collect.sleep")
+    def test_return_cancels_system_prompt_and_uses_detail_back_button(self, _sleep):
+        collector = Collector(Mock(), Mock(), Mock(), 3)
+        popup = Viewport((), (), False, False, voice_cancel=(299, 2061))
+        detail = Viewport((), (), False, False, detail_back=(81, 168))
+        original = (b"list", Viewport((), (), False, True, "河北宁夏"))
+        collector._read_list = Mock(
+            side_effect=[(b"popup", popup), (b"detail", detail), original]
+        )
+        self.assertEqual(
+            collector._wait_for_list("河北宁夏", recover_detail=True), original
+        )
+        self.assertEqual(
+            [call.args for call in collector.device.tap.call_args_list],
+            [(299, 2061), (81, 168)],
+        )
+
+    @patch("x001.collect.sleep")
+    def test_retries_detail_back_when_detail_remains_visible(self, _sleep):
+        collector = Collector(Mock(), Mock(), Mock(), 3)
+        detail = (b"detail", Viewport((), (), False, False, detail_back=(81, 168)))
+        original = (b"list", Viewport((), (), False, True, "宁夏河北"))
+        collector._read_list = Mock(side_effect=[detail] * 5 + [original])
+
+        self.assertEqual(
+            collector._wait_for_list("宁夏河北", recover_detail=True), original
+        )
+        self.assertEqual(
+            [call.args for call in collector.device.tap.call_args_list],
+            [(81, 168), (81, 168)],
+        )
+
+    @patch("x001.collect.sleep")
+    def test_detail_waits_for_placeholder_buttons_before_scrolling(self, _sleep):
+        image = Image.new("RGB", (1080, 2340), "white")
+        ready_buffer = BytesIO()
+        image.save(ready_buffer, format="PNG")
+        ready = ready_buffer.getvalue()
+        ImageDraw.Draw(image).rectangle((30, 2059, 1050, 2153), fill=(244, 244, 244))
+        loading_buffer = BytesIO()
+        image.save(loading_buffer, format="PNG")
+        loading = loading_buffer.getvalue()
+        device, store, worker = Mock(), Mock(), Mock()
+        device.screenshot.side_effect = [loading, ready, ready, ready]
+        worker.request.return_value = [
+            ("预估里程", 590, 100, 850, 132),
+            ("车辆", 85, 150, 163, 190),
+        ]
+        store.begin.return_value = 1
+        with tempfile.TemporaryDirectory() as temporary:
+            store.folder.return_value = Path(temporary) / "1"
+            collector = Collector(device, store, worker, 3)
+            collector._capture_detail(Card("test", 270, 900, None), ready)
+            first_detail = store.folder.return_value / "detail-01.png"
+            self.assertEqual(first_detail.read_bytes(), ready)
+        self.assertEqual(
+            [call.args[1][1] for call in worker.request.call_args_list],
+            [loading, ready],
+        )
+        device.scroll.assert_called_once()
+
+    @patch("x001.collect.sleep")
+    def test_persistent_loading_saves_confirmed_detail_and_returns(self, _sleep):
+        image = Image.new("RGB", (1080, 2340), "white")
+        ImageDraw.Draw(image).rectangle((30, 2059, 1050, 2153), fill=(244, 244, 244))
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        frame = buffer.getvalue()
+        device, store, worker = Mock(), Mock(), Mock()
+        device.screenshot.return_value = frame
+        worker.request.return_value = [
+            ("预估里程", 590, 100, 850, 132),
+            ("车辆", 85, 150, 163, 190),
+        ]
+        store.begin.return_value = 1
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "1"
+            store.folder.return_value = directory
+            collector = Collector(device, store, worker, 3)
+            self.assertEqual(
+                collector._capture_detail(Card("test", 270, 900, None), frame), 1
+            )
+            store.publish.assert_called_once_with(
+                1, [directory / "card.png", directory / "detail-01.png"]
+            )
+        device.back.assert_called_once()
+        device.scroll.assert_not_called()
+
+    @patch("x001.collect.sleep")
+    def test_scrolls_past_gray_cards_and_opens_only_unread_card(self, _sleep):
+        png = BytesIO()
+        Image.new("RGB", (1080, 2340), "white").save(png, format="PNG")
+        gray = Card("已读|电议", 270, 600, None, viewed=True)
+        unread = Card("未读|电议", 270, 960, None)
+        store = Mock()
+        store.active_count.return_value = 0
+        collector = Collector(Mock(), store, Mock(), 3)
+        collector._read_list = Mock(
+            side_effect=[
+                (png.getvalue(), Viewport((gray,), (), False, True, "宁夏河北")),
+                (png.getvalue(), Viewport((gray, unread), (), False, True, "宁夏河北")),
+            ]
+        )
+        collector._capture_detail = Mock(return_value=1)
+        self.assertIn("requested limit (1)", collector.run(1))
+        collector.device.scroll.assert_called_once()
+        collector._capture_detail.assert_called_once_with(
+            unread, png.getvalue(), "宁夏河北"
+        )
+
+    @patch("x001.collect.sleep")
+    def test_wait_for_list_retries_until_the_original_route_returns(self, _sleep):
+        collector = Collector(Mock(), Mock(), Mock(), 3)
+        detail = (b"detail", Viewport((), (), False, False))
+        other = (b"other", Viewport((), (), False, True, "宁夏天津"))
+        original = (b"list", Viewport((), (), False, True, "宁夏河北"))
+        collector._read_list = Mock(
+            side_effect=[detail, detail, detail, other, original]
+        )
+        self.assertEqual(collector._wait_for_list("宁夏河北"), original)
+
+        collector._read_list = Mock(return_value=other)
+        with self.assertRaisesRegex(RuntimeError, "last OCR route='宁夏天津'"):
+            collector._wait_for_list("宁夏河北")
+
+    @patch("x001.collect.sleep")
     @patch("x001.collect.exclusive_run")
     @patch("x001.collect.ADBController")
     @patch("x001.collect.Collector")
@@ -174,28 +459,97 @@ class CollectorTests(unittest.TestCase):
         worker_type.return_value.close.assert_called_once_with(graceful=True)
 
     @patch("x001.collect.sleep")
-    def test_recommendation_streak_returns_to_top_and_refreshes(self, _sleep):
+    def test_recommendation_section_refreshes_and_restarts_without_recapturing(
+        self, _sleep
+    ):
         png = BytesIO()
         Image.new("RGB", (1080, 2340), "white").save(png, format="PNG")
-        cards = tuple(
-            Card(str(i), 270, 600 + 350 * i, None, recommended=True) for i in range(3)
+        initial_cards = (
+            Card("regular-1", 270, 600, None),
+            Card("regular-2", 270, 950, None),
+            Card("recommended-1", 270, 1300, None, recommended=True),
+            Card("recommended-2", 270, 1650, None, recommended=True),
         )
-        frame = png.getvalue(), Viewport(cards, (), False, True, "宁夏天津")
+        refreshed_cards = (
+            *initial_cards[:2],
+            Card("regular-new", 270, 1120, None),
+            *initial_cards[2:],
+        )
+        initial = (
+            png.getvalue(),
+            Viewport(initial_cards, (), False, True, "宁夏天津"),
+        )
+        refreshed = (
+            png.getvalue(),
+            Viewport(refreshed_cards, (), False, True, "宁夏天津"),
+        )
         store = Mock()
         store.active_count.return_value = 0
         collector = Collector(Mock(), store, Mock(), 3)
-        collector._read_list = Mock(return_value=frame)
+        collector._read_list = Mock(side_effect=[initial, initial, initial, refreshed])
         collector._capture_detail = Mock(side_effect=[1, 2, 3])
-        result = collector.run(None)
-        self.assertIn("Stopped after 3 recommendations", result)
-        self.assertIn("pull-to-refresh", result)
-        collector.device.scroll.assert_called_once()
-        self.assertEqual(collector.device.scroll.call_args.args, ("down",))
+        collector._return_and_refresh = Mock(return_value=None)
+
+        result = collector.run(3)
+
+        self.assertIn("requested limit (3)", result)
+        self.assertEqual(
+            [call.args[0].key for call in collector._capture_detail.call_args_list],
+            ["regular-1", "regular-2", "regular-new"],
+        )
+        collector._return_and_refresh.assert_called_once_with(
+            "宁夏天津", initial[0], initial[1]
+        )
 
     @patch("x001.collect.sleep")
-    def test_streak_does_not_skip_regular_card_visible_below_recommendations(
-        self, _sleep
-    ):
+    def test_return_to_top_issues_a_separate_refresh_pull(self, _sleep):
+        png = BytesIO()
+        Image.new("RGB", (1080, 2340), "white").save(png, format="PNG")
+        image = png.getvalue()
+        view = Viewport(
+            (Card("recommended", 270, 600, None, recommended=True),),
+            (),
+            False,
+            True,
+            "宁夏天津",
+        )
+        collector = Collector(Mock(), Mock(), Mock(), 3)
+        collector._wait_for_list = Mock(return_value=(image, view))
+
+        self.assertIsNone(collector._return_and_refresh("宁夏天津", image, view))
+
+        self.assertEqual(collector.device.scroll.call_count, 2)
+        self.assertEqual(collector.device.scroll.call_args_list[0].args, ("down",))
+        self.assertEqual(collector.device.scroll.call_args_list[1].args, ("down",))
+        self.assertEqual(
+            collector.device.scroll.call_args_list[1].kwargs["distance"], 585
+        )
+
+    @patch("x001.collect.sleep")
+    def test_refresh_waits_until_the_refresh_indicator_clears(self, _sleep):
+        png = BytesIO()
+        Image.new("RGB", (1080, 2340), "white").save(png, format="PNG")
+        image = png.getvalue()
+        card = Card("recommended", 270, 600, None, recommended=True)
+        initial = Viewport((card,), (), False, True, "宁夏天津")
+        refreshing = Viewport((card,), (), False, True, "宁夏天津", refreshing=True)
+        settled = Viewport((card,), (), False, True, "宁夏天津")
+        collector = Collector(Mock(), Mock(), Mock(), 3)
+        collector._wait_for_list = Mock(
+            side_effect=[
+                (image, refreshing),
+                (image, refreshing),
+                (image, settled),
+            ]
+        )
+
+        self.assertIsNone(collector._return_and_refresh("宁夏天津", image, initial))
+
+        collector.device.scroll.assert_called_once()
+        self.assertEqual(collector._wait_for_list.call_count, 3)
+
+    @patch("x001.collect.sleep")
+    def test_regular_card_below_recommendations_is_still_captured(self, _sleep):
         png = BytesIO()
         Image.new("RGB", (1080, 2340), "white").save(png, format="PNG")
         cards = tuple(
@@ -207,8 +561,11 @@ class CollectorTests(unittest.TestCase):
         collector._read_list = Mock(
             return_value=(png.getvalue(), Viewport(cards, (), False, True, "宁夏天津"))
         )
-        collector._capture_detail = Mock(side_effect=[1, 2, 3, 4])
-        self.assertIn("requested limit (4)", collector.run(4))
+        collector._capture_detail = Mock(return_value=4)
+        self.assertIn("requested limit (1)", collector.run(1))
+        collector._capture_detail.assert_called_once_with(
+            cards[3], png.getvalue(), "宁夏天津"
+        )
         collector.device.scroll.assert_not_called()
 
     @patch("x001.collect.sleep")
@@ -260,6 +617,8 @@ class CollectorTests(unittest.TestCase):
         b = Card("乙|320元/吨", 270, 1150, "320元/吨")
         frames = [
             Viewport((a,), ((540, 2050),), False, True, "宁夏→天津"),
+            Viewport((a,), ((542, 2052),), False, True, "宁夏→天津"),
+            Viewport((a,), (), False, True, "宁夏→天津"),
             Viewport((a,), (), False, True, "宁夏→天津"),
             Viewport((a,), (), False, True, "宁夏→天津"),
             Viewport((overlap, b), (), False, True, "宁夏→天津"),
@@ -290,6 +649,175 @@ class CollectorTests(unittest.TestCase):
 
 
 class FreightTests(unittest.TestCase):
+    def test_failed_second_opinion_keeps_primary_result_for_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "test.sqlite3")
+            try:
+                store.initialize()
+                capture_id = store.begin("锌锭33-35吨|电议", None, "宁夏河北")
+                folder = store.folder(capture_id)
+                folder.mkdir(parents=True)
+                card = folder / "card.png"
+                detail = folder / "detail.png"
+                Image.new("RGB", (1080, 2340), "white").save(card)
+                Image.new("RGB", (1080, 2340), "white").save(detail)
+                store.publish(capture_id, [card, detail])
+                task = store.take()
+                engine = object.__new__(HybridEngine)
+                fields = {"weight": "33.35吨", "truck_count": "1"}
+                lines = [("货物锌锭", 100, 100, 300, 140)]
+
+                with (
+                    patch("x001.collect.recognize_detail", return_value=lines),
+                    patch("x001.collect.detail_confirmed", return_value=True),
+                    patch(
+                        "x001.collect.resolve_feedback",
+                        return_value=(fields, {"weight"}),
+                    ),
+                    patch("x001.collect.clean_freight"),
+                    patch.object(
+                        engine,
+                        "locate_secondary",
+                        side_effect=RuntimeError("model initialization failed"),
+                    ),
+                ):
+                    list(_recognize_group(engine, store, task, {}))
+
+                capture = store.db.execute(
+                    "SELECT status, error FROM captures WHERE id=?", (capture_id,)
+                ).fetchone()
+                result = store.db.execute(
+                    "SELECT weight, review_fields, second_opinion "
+                    "FROM freight WHERE capture_id=?",
+                    (capture_id,),
+                ).fetchone()
+            finally:
+                store.db.close()
+
+        self.assertEqual(tuple(capture), ("done", None))
+        self.assertEqual(result["weight"], "33.35吨")
+        self.assertEqual(json.loads(result["review_fields"]), ["weight"])
+        opinion = json.loads(result["second_opinion"])
+        self.assertEqual(opinion["target_fields"], ["weight"])
+        self.assertEqual(opinion["fields"], {})
+        self.assertEqual(opinion["error"], "model initialization failed")
+
+    def test_second_opinion_is_stored_as_a_suggestion_for_requested_fields(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Image.new("RGB", (1080, 2340), "white").save(root / "detail-01.png")
+            lines = [("货物锌锭总重量33-35吨吨包", 460, 800, 990, 850)]
+            engine = Mock()
+            engine.locate_secondary.return_value = lines
+
+            opinion = _second_opinion(
+                engine,
+                SimpleNamespace(root=root),
+                ["detail-01.png"],
+                {"weight"},
+                None,
+                "锌锭33-35吨|电议",
+            )
+
+        self.assertEqual(opinion["fields"], {"weight": "总重33-35吨 吨包"})
+        self.assertEqual(opinion["raw_pages"], [lines])
+        self.assertEqual(opinion["engine"], "RapidOCR PP-OCRv5 mobile/OpenVINO")
+        self.assertEqual(opinion["target_fields"], ["weight"])
+        self.assertGreaterEqual(opinion["seconds"], 0)
+
+    def test_unlabeled_address_aligned_with_dropoff_badge_is_recovered(self):
+        image = Image.new("RGB", (1080, 900), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((75, 200, 116, 240), fill=(220, 30, 30))
+        draw.rectangle((75, 300, 116, 340), fill=(0, 0, 0))
+        address = ("保定市·雄县", 140, 304, 410, 343)
+        engine = object.__new__(WindowsOCR)
+
+        with patch.object(WindowsOCR, "locate", side_effect=[[address], [], []]):
+            lines = recognize_detail(engine, image, first=True)
+
+        self.assertIn("卸:保定市·雄县", [line[0] for line in lines])
+        self.assertNotIn("保定市·雄县", [line[0] for line in lines])
+
+    def test_recovers_loading_time_when_ocr_merges_dash_and_leading_one(self):
+        fields = {}
+        review = set()
+
+        clean_freight(
+            [[("明天06：00刁2：00可装", 41, 49, 600, 120)]],
+            fields,
+            review,
+            "",
+        )
+
+        self.assertEqual(fields["other_info"], "明天06:00-12:00可装")
+        self.assertNotIn("other_info", review)
+
+    def test_list_card_confirms_a_malformed_loading_time(self):
+        fields = {}
+        review = set()
+
+        clean_freight(
+            [[("明天06：00刁／：00可装", 41, 49, 600, 120)]],
+            fields,
+            review,
+            "矿粉吨包明6-17点装货|220元/吨",
+        )
+
+        self.assertEqual(fields["other_info"], "明天6-17点装货")
+        self.assertNotIn("other_info", review)
+
+    def test_cleaning_formats_table_and_keeps_ambiguous_weight_for_review(self):
+        lines = [
+            ("明天06:00-12:00可装", 41, 49, 600, 120),
+            ("结算4·5爽约4·4评价4·5", 230, 550, 666, 583),
+            ("货物矿渣总重量33．36吨散装", 85, 810, 995, 850),
+            ("净得运费6200元", 85, 950, 995, 990),
+            ("灬费6200元/趟", 85, 1050, 995, 1090),
+        ]
+        fields = extract_fields([lines], None)
+        fields.update(loading_location="唐山市·迁西县O", truck_count="2")
+        review = set()
+        clean_freight([lines], fields, review, "")
+        self.assertEqual(fields["loading_location"], "唐山市-迁西县")
+        self.assertEqual(fields["cargo"], "矿渣")
+        self.assertEqual(fields["weight"], "总重33.36吨 散装")
+        self.assertEqual(fields["truck_count"], "还需2辆")
+        self.assertEqual(fields["price"], "净得6200元(总运费6200元/趟)")
+        self.assertEqual(
+            fields["other_info"], "明天06:00-12:00可装；结算4.5/爽约4.4/评价4.5"
+        )
+        self.assertIn("weight", review)
+
+    def test_mileage_reads_only_the_estimated_distance_column(self):
+        lines = [
+            ("1003·6km", 135, 502, 319, 535),
+            ("11OOkm", 592, 502, 736, 535),
+            ("9.6米/预估里程", 589, 559, 793, 589),
+        ]
+        self.assertEqual(extract_fields([lines], None)["estimated_distance"], "1100km")
+
+    def test_truncated_net_price_requires_total_and_fee_to_recover(self):
+        net_and_total = [
+            ("净得运费300元", 85, 950, 995, 990),
+            ("总运费6500元/趟", 85, 1050, 995, 1090),
+        ]
+        key = "筛子|6300元"
+        fields = extract_fields([net_and_total], None, key)
+        review = set()
+        clean_freight([net_and_total], fields, review, key)
+        self.assertEqual(fields["price"], "6500元/趟")
+        self.assertIn("price", review)
+
+        lines = net_and_total + [("信息费200元", 85, 1150, 995, 1190)]
+        fields = extract_fields([lines], None, key)
+        review = set()
+        clean_freight([lines], fields, review, key)
+        self.assertEqual(fields["price"], "净得6300元(总运费6500元/趟)")
+        self.assertNotIn("price", review)
+
     def test_recommended_badge_is_distinct_from_similar(self):
         image = Image.new("RGB", (1080, 2340), (240, 240, 240))
         draw = ImageDraw.Draw(image)
@@ -313,6 +841,31 @@ class FreightTests(unittest.TestCase):
             )
         self.assertEqual(
             [c.recommended for c in read_viewport(image, lines).cards], [True, False]
+        )
+
+    def test_recommendation_section_header_marks_only_cards_below_it(self):
+        image = Image.new("RGB", (1080, 2340), (240, 240, 240))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 500, 1079, 840), fill="white")
+        draw.rectangle((0, 900, 1079, 1320), fill="white")
+        lines = [
+            ("宁夏→天津", 380, 35, 670, 85),
+            ("未开启听单", 145, 247, 365, 289),
+            ("筛选", 917, 250, 1030, 288),
+            ("银川灵武→天津滨海新区", 38, 400, 650, 448),
+            ("13米平板33吨", 38, 505, 590, 545),
+            ("280元/吨", 840, 550, 1040, 600),
+            ("去抢单", 885, 660, 1000, 700),
+            ("推荐货源", 400, 740, 680, 780),
+            ("石嘴山大武口→廊坊广阳", 38, 845, 650, 893),
+            ("13米平板33吨", 38, 950, 590, 990),
+            ("7300元/趟", 840, 995, 1040, 1045),
+            ("去抢单", 885, 1145, 1000, 1185),
+        ]
+
+        self.assertEqual(
+            [card.recommended for card in read_viewport(image, lines).cards],
+            [False, True],
         )
 
     def test_feedback_uses_complete_vehicle_or_marks_the_field(self):

@@ -6,8 +6,10 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.0",
+    "openvino>=2026.4.1,<2027.0.0",
     "paddleocr>=3.7.0,<4.0.0",
     "pillow>=11.0",
+    "rapidocr>=3.10.0,<4.0.0",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
     "transformers>=5.10.0",
@@ -21,6 +23,7 @@ dev = ["ruff>=0.14.0,<1.0"]
 x001 = "x001.ocr:main"
 x001-ocr = "x001.ocr:main"
 x001-collect = "x001.collect:main"
+x001-export = "x001.export:main"
 x001-init = "x001.initialize:main"
 
 [tool.ruff]
