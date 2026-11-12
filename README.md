@@ -32,9 +32,12 @@ texts = recognizer.extract_text("path/to/image.png")
 
 ## Android device control with ADB
 
-Enable USB debugging on the Android phone, connect it to the computer, and
-confirm it is listed by `adb devices`. Then use `ADBController` to tap screen
-coordinates, go back, or swipe:
+The project includes Windows platform-tools (revision 37.0.1), and
+`ADBController` uses its bundled `adb.exe` by default on Windows. Enable USB
+debugging on the Android phone, connect it to the computer, and confirm it is
+listed by running `.\src\x001\platform-tools\adb.exe devices`. On other
+platforms, install ADB and make it available on `PATH`. Then use
+`ADBController` to tap screen coordinates, go back, or swipe:
 
 ```python
 from x001.adb import ADBController

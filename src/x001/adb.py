@@ -1,12 +1,20 @@
+import os
 import subprocess
 from pathlib import Path
+
+
+_DEFAULT_ADB_PATH = (
+    Path(__file__).parent / "platform-tools" / "adb.exe"
+    if os.name == "nt"
+    else "adb"
+)
 
 
 class ADBController:
     def __init__(
         self,
         serial: str | None = None,
-        adb_path: str | Path = "adb",
+        adb_path: str | Path = _DEFAULT_ADB_PATH,
         timeout: float = 10,
     ) -> None:
         if serial == "":

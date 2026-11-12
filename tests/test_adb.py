@@ -1,8 +1,17 @@
+import os
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+from x001 import adb
 from x001.adb import ADBController
+
+
+def _expected_default_adb_path() -> str:
+    if os.name == "nt":
+        return str(Path(adb.__file__).parent / "platform-tools" / "adb.exe")
+    return "adb"
 
 
 class ADBControllerTests(unittest.TestCase):
@@ -13,7 +22,16 @@ class ADBControllerTests(unittest.TestCase):
         controller.tap(12, 34)
 
         run.assert_called_once_with(
-            ["adb", "-s", "device-1", "shell", "input", "tap", "12", "34"],
+            [
+                _expected_default_adb_path(),
+                "-s",
+                "device-1",
+                "shell",
+                "input",
+                "tap",
+                "12",
+                "34",
+            ],
             check=True,
             capture_output=True,
             text=True,
@@ -25,7 +43,13 @@ class ADBControllerTests(unittest.TestCase):
         ADBController().back()
 
         run.assert_called_once_with(
-            ["adb", "shell", "input", "keyevent", "KEYCODE_BACK"],
+            [
+                _expected_default_adb_path(),
+                "shell",
+                "input",
+                "keyevent",
+                "KEYCODE_BACK",
+            ],
             check=True,
             capture_output=True,
             text=True,
