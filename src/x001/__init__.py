@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from x001!")
+"""OCR and Android device automation utilities."""

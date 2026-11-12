@@ -1,7 +1,7 @@
 [project]
 name = "x001"
 version = "0.1.0"
-description = "Add your description here"
+description = "OCR and Android device automation utilities."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -9,11 +9,22 @@ dependencies = [
     "torch>=2.8.0",
     "torchvision>=0.23.0",
     "transformers>=5.10.0",
+    "uiautomator2>=3.7.1,<4.0.0",
 ]
 
+[dependency-groups]
+dev = ["ruff>=0.14.0,<1.0"]
+
 [project.scripts]
-x001 = "x001:main"
+x001 = "x001.ocr:main"
 x001-ocr = "x001.ocr:main"
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
 
 [tool.uv]
 # PaddleX pins 6.0.2, which has no Windows wheel for this project's Python 3.14.
