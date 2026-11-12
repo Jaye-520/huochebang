@@ -4,10 +4,29 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "paddleocr>=3.7.0,<4.0.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "transformers>=5.10.0",
+]
 
 [project.scripts]
 x001 = "x001:main"
+x001-ocr = "x001.ocr:main"
+
+[tool.uv]
+# PaddleX pins 6.0.2, which has no Windows wheel for this project's Python 3.14.
+override-dependencies = ["pyyaml==6.0.3"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
