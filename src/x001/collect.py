@@ -3,6 +3,7 @@
 import argparse
 import json
 import multiprocessing as mp
+import re
 import sqlite3
 import sys
 from collections import deque
@@ -46,9 +47,22 @@ from .vision import (
 _OCR_RESPONSE_TIMEOUT = 600
 _LIST_READ_ATTEMPTS = 6
 _SECOND_OPINION_ENGINE = "RapidOCR PP-OCRv5 mobile/OpenVINO"
+_AMBIGUOUS_WEIGHT_RANGE = re.compile(
+    r"(?P<prefix>总重)?(?P<lower>[1-9]\d+)\.(?P<upper>[1-9]\d+)吨"
+)
 
 type _CachedPage = tuple[list[Line], int, float]
-_SECOND_OPINION_FIELDS = {"weight", "other_info"}
+_SECOND_OPINION_FIELDS = {
+    "weight",
+    "other_info",
+    "price",
+    "loading_location",
+    "unloading_location",
+    "vehicle",
+    "shipper",
+    "cargo",
+    "estimated_distance",
+}
 
 
 class _SecondOpinionBase(TypedDict):
@@ -61,6 +75,7 @@ class _SecondOpinion(_SecondOpinionBase):
     review_fields: list[str]
     seconds: float
     raw_pages: list[list[Line]]
+    applied_fields: list[str]
 
 
 class _SecondOpinionFailure(_SecondOpinionBase):
@@ -139,11 +154,21 @@ def _recognize_group(
                     )
                 else:
                     seconds += second_opinion["seconds"]
-                    print(
-                        f"#{capture_id} PP-OCRv5 second opinion "
-                        f"(not applied): {second_opinion['fields']}",
-                        flush=True,
+                    weight_applied = _reconcile_consensus_weight(
+                        fields, review, second_opinion
                     )
+                    if weight_applied:
+                        print(
+                            f"#{capture_id} PP-OCRv5 consensus corrected weight "
+                            f"to {fields['weight']}; other suggestions not applied",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"#{capture_id} PP-OCRv5 second opinion "
+                            f"(not applied): {second_opinion['fields']}",
+                            flush=True,
+                        )
         store.complete(
             capture_id, pages, fields, seconds, review, second_opinion=second_opinion
         )
@@ -178,7 +203,39 @@ def _second_opinion(
         "review_fields": sorted(review),
         "seconds": monotonic() - start,
         "raw_pages": pages,
+        "applied_fields": [],
     }
+
+
+def _reconcile_consensus_weight(
+    fields: dict[str, str], review: set[str], opinion: _SecondOpinion
+) -> bool:
+    """Apply only an unambiguous cross-engine decimal-to-range correction."""
+    primary = fields.get("weight")
+    secondary = opinion["fields"].get("weight")
+    if (
+        "weight" not in review
+        or not primary
+        or not secondary
+        or "weight" in opinion["review_fields"]
+    ):
+        return False
+
+    match = _AMBIGUOUS_WEIGHT_RANGE.search(primary)
+    if not match:
+        return False
+    range_candidate = (
+        primary[: match.start()]
+        + match.group().replace(".", "-", 1)
+        + primary[match.end() :]
+    )
+    if range_candidate != secondary:
+        return False
+
+    fields["weight"] = secondary
+    review.remove("weight")
+    opinion["applied_fields"].append("weight")
+    return True
 
 
 def _worker(path: Path, backend: str, connection: Connection) -> None:
@@ -603,10 +660,10 @@ class Collector:
             flush=True,
         )
 
-    def run(self, maximum: int | None) -> str:
+    def run(self, maximum: int | None, expected_route: str = "") -> str:
         old_cards: tuple[Card, ...] = ()
         visits: list[int | None] = []
-        route = ""
+        route = expected_route
         old_view = None
         old_image = None
         history = deque(maxlen=12)
@@ -737,6 +794,11 @@ def main() -> None:
         "--capacity", type=int, default=3, help="未完成截图组上限（默认 %(default)s）"
     )
     parser.add_argument("--max-orders", type=int, help="本轮最多采集的货源数")
+    parser.add_argument(
+        "--expected-route",
+        default="",
+        help="预期线路；手机顶部识别的线路不一致时停止采集",
+    )
     processing = parser.add_mutually_exclusive_group()
     processing.add_argument(
         "--process-only", action="store_true", help="仅处理已有截图组"
@@ -776,7 +838,7 @@ def main() -> None:
                             print(
                                 Collector(
                                     ADBController(), store, worker, args.capacity
-                                ).run(args.max_orders),
+                                ).run(args.max_orders, args.expected_route),
                                 flush=True,
                             )
                         except (

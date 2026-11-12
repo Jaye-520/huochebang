@@ -15,6 +15,13 @@ _WEIGHT = re.compile(r"\d+(?:\.\d+)?(?:[-–~至、]\d+(?:\.\d+)?)?吨")
 _COUNT = re.compile(r"(?:还需|需要车数[:：]?)?(\d+)辆")
 _BLOCK = re.compile(r"^(?:车辆|货物|需要车数|运费|订金|净得运费|实付技术服务费)")
 _PACKAGING = re.compile(r"[,(]?(吨袋|吨包|袋装|散装|裸装|捆扎|纸箱|筐装|托盘|其他)\)?$")
+_PACKAGING_OCR_FIXES = {
+    "散丬": "散装",
+    "散〗": "散装",
+    "袋丬": "袋装",
+    "袋〗": "袋装",
+    "捆扌": "捆扎",
+}
 _RATING = re.compile(
     r"结算([0-5](?:\.\d+)?)爽约([0-5](?:\.\d+)?)评价([0-5](?:\.\d+)?)$"
 )
@@ -304,7 +311,9 @@ def extract_fields(
                     text.removeprefix("货主要求").lstrip(":").removesuffix("问货主")
                 ]
                 for extra in compact[number + 1 :]:
-                    if _BLOCK.match(extra) or extra.startswith(("接单前", "查看详情")):
+                    if _BLOCK.match(extra) or extra.startswith(
+                        ("接单前", "查看详情", "以上信息由系统", "常见问题")
+                    ):
                         break
                     if not extra.startswith(("问货主", "货源反馈", "展开", "收起")):
                         note.append(
@@ -338,8 +347,13 @@ def clean_freight(
         if address := fields.get(key):
             address = re.sub(r"(?<=[\u4e00-\u9fff])[Oo○]$", "", address)
             address = re.sub(r"(?<!\d)[.·、。]+|[.·、。]+(?!\d)", "-", address)
-            fields[key] = address.strip("-")
-            if re.search(r"[，,丿“”]|[\u4e00-\u9fff][Oo0]$", address):
+            # OCR can mistake the colored pickup/dropoff marker for a vertical bar.
+            address = re.sub(r"[|丨｜]+", "-", address)
+            address = re.sub(r"一/$", "", address).strip("-")
+            if match := re.fullmatch(r"([\u4e00-\u9fff]{2,})\1", address):
+                address = match[1]
+            fields[key] = address
+            if re.search(r"[，,丿《“”]|^市-|[\u4e00-\u9fff][Oo0]$", address):
                 review.add(key)
 
     details = []
@@ -348,13 +362,22 @@ def clean_freight(
         if delivery := re.search(r"(卸(?:货地:?)?个人货场)$", cargo):
             details.append(delivery[1])
             cargo = cargo[: delivery.start()]
+        for observed, corrected in _PACKAGING_OCR_FIXES.items():
+            if cargo.endswith(observed):
+                cargo = cargo[: -len(observed)] + corrected
+                break
         if packaging := _PACKAGING.search(cargo):
             cargo = cargo[: packaging.start()].rstrip(",")
+            if cargo.startswith(packaging[1]) and len(cargo) > len(packaging[1]):
+                cargo = cargo[len(packaging[1]) :]
         if "weight" in fields and (size := re.search(r"(\d+(?:-\d+)?方)$", cargo)):
             volume = size[1]
             cargo = cargo[: size.start()]
         if "总重量" in cargo:
             review.update(("cargo", "weight"))
+            cargo = re.sub(r"总重量\d+(?:[.．]\d*)?$", "", cargo)
+        if re.search(r"[〗丬扌亻弋]", cargo):
+            review.add("cargo")
         if cargo:
             fields["cargo"] = cargo
         else:
@@ -495,7 +518,7 @@ def clean_freight(
                     loading_time_reviewed = True
                     if start := re.search(r"(\d{1,2}):\d{2}", line):
                         loading_start_hour = int(start[1])
-                elif re.search(r"装货|可装|\d{1,2}:\d{2}", line):
+                elif re.search(r"装货|可装", line):
                     loading_time = line.replace(",", "，").strip("，")
                     break
     if loading_time is None and (
@@ -520,7 +543,11 @@ def clean_freight(
     if loading_time:
         details.insert(0, loading_time)
     if note := fields.get("other_info"):
-        details.append(re.sub(r"[,，]+", "，", note).strip("，；"))
+        note = note.split("以上信息由系统", 1)[0]
+        note = re.sub(r"[,，]+", "，", note)
+        note = re.sub(r"[;；]+", "；", note).strip("，；。")
+        if note:
+            details.append(note)
     ratings = {match.groups() for row in text if (match := _RATING.search(row))}
     if len(ratings) == 1:
         settlement, cancellation, rating = next(iter(ratings))
@@ -529,6 +556,16 @@ def clean_freight(
         review.add("other_info")
     if details:
         fields["other_info"] = "；".join(dict.fromkeys(filter(None, details)))
+    if price_match := re.fullmatch(r"(\d+(?:\.\d+)?)元", fields.get("price", "")):
+        unit_rates = {rate for rate in rates if rate.startswith(price_match[1] + "元/")}
+        if (
+            "price" not in review
+            and len(unit_rates) == 1
+            and listed_price in unit_rates
+        ):
+            fields["price"] = listed_price
+        else:
+            review.add("price")
     review.update(
         key
         for key in (

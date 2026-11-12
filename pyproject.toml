@@ -14,6 +14,7 @@ dependencies = [
     "torchvision>=0.23.0",
     "transformers>=5.10.0",
     "uiautomator2>=3.7.1,<4.0.0",
+    "xlsxwriter>=3.2,<4.0",
 ]
 
 [dependency-groups]
@@ -25,6 +26,8 @@ x001-ocr = "x001.ocr:main"
 x001-collect = "x001.collect:main"
 x001-export = "x001.export:main"
 x001-init = "x001.initialize:main"
+x001-web = "x001.web:main"
+x001-launcher = "x001.launcher:main"
 
 [tool.ruff]
 line-length = 88

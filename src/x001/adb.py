@@ -19,7 +19,7 @@ _TARGET_ACTIVITY = f"{_TARGET_PACKAGE}/.activity.HomeActivity"
 _DEFAULT_INPUT_BACKEND = "uiautomator"
 _DEFAULT_SCREEN_SIZE = (1080, 2340)
 
-_DEFAULT_ADB_PATH = (
+DEFAULT_ADB_PATH = (
     Path(__file__).parent / "platform-tools" / "adb.exe" if os.name == "nt" else "adb"
 )
 
@@ -230,7 +230,7 @@ class ADBController:
     def __init__(
         self,
         serial: str | None = _TARGET_SERIAL,
-        adb_path: str | Path = _DEFAULT_ADB_PATH,
+        adb_path: str | Path = DEFAULT_ADB_PATH,
         timeout: float = 10,
         input_backend: str = _DEFAULT_INPUT_BACKEND,
         screen_size: tuple[int, int] = _DEFAULT_SCREEN_SIZE,

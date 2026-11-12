@@ -8,7 +8,14 @@ from unittest.mock import Mock, patch
 
 from PIL import Image, ImageDraw
 
-from x001.collect import Collector, _recognize_group, _save, _second_opinion, main
+from x001.collect import (
+    Collector,
+    _recognize_group,
+    _reconcile_consensus_weight,
+    _save,
+    _second_opinion,
+    main,
+)
 from x001.engines import HybridEngine, WindowsOCR
 from x001.freight import (
     clean_freight,
@@ -309,6 +316,15 @@ class StorageTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    @patch("x001.collect.sleep")
+    def test_expected_route_rejects_different_phone_route(self, _sleep):
+        collector = Collector(Mock(), Mock(), Mock(), 3)
+        collector._read_list = Mock(
+            return_value=(b"list", Viewport((), (), False, True, "宁夏天津"))
+        )
+        with self.assertRaisesRegex(RuntimeError, "expected='宁夏河北'"):
+            collector._wait_for_list("宁夏河北")
+
     @patch("x001.collect.sleep")
     def test_return_cancels_system_prompt_and_uses_detail_back_button(self, _sleep):
         collector = Collector(Mock(), Mock(), Mock(), 3)
@@ -649,6 +665,39 @@ class CollectorTests(unittest.TestCase):
 
 
 class FreightTests(unittest.TestCase):
+    def test_consensus_range_corrects_only_the_suspected_separator(self):
+        fields = {"weight": "总重200.210吨 吨包"}
+        review = {"weight"}
+        opinion = {
+            "fields": {"weight": "总重200-210吨 吨包"},
+            "review_fields": [],
+            "applied_fields": [],
+        }
+
+        self.assertTrue(_reconcile_consensus_weight(fields, review, opinion))
+        self.assertEqual(fields["weight"], "总重200-210吨 吨包")
+        self.assertEqual(review, set())
+        self.assertEqual(opinion["applied_fields"], ["weight"])
+
+    def test_consensus_weight_is_not_applied_when_opinions_differ_or_are_reviewed(self):
+        for secondary, secondary_review in (
+            ("总重200-211吨 吨包", []),
+            ("总重200-210吨 吨包", ["weight"]),
+        ):
+            with self.subTest(secondary_review=secondary_review):
+                fields = {"weight": "总重200.210吨 吨包"}
+                review = {"weight"}
+                opinion = {
+                    "fields": {"weight": secondary},
+                    "review_fields": secondary_review,
+                    "applied_fields": [],
+                }
+
+                self.assertFalse(_reconcile_consensus_weight(fields, review, opinion))
+                self.assertEqual(fields["weight"], "总重200.210吨 吨包")
+                self.assertEqual(review, {"weight"})
+                self.assertEqual(opinion["applied_fields"], [])
+
     def test_failed_second_opinion_keeps_primary_result_for_review(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "test.sqlite3")
@@ -702,6 +751,66 @@ class FreightTests(unittest.TestCase):
         self.assertEqual(opinion["fields"], {})
         self.assertEqual(opinion["error"], "model initialization failed")
 
+    def test_recognize_group_applies_clean_cross_engine_weight_agreement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "test.sqlite3")
+            try:
+                store.initialize()
+                capture_id = store.begin("锌锭33-34吨|电议", None, "宁夏河北")
+                folder = store.folder(capture_id)
+                folder.mkdir(parents=True)
+                card = folder / "card.png"
+                detail = folder / "detail.png"
+                Image.new("RGB", (1080, 2340), "white").save(card)
+                Image.new("RGB", (1080, 2340), "white").save(detail)
+                store.publish(capture_id, [card, detail])
+                task = store.take()
+                engine = object.__new__(HybridEngine)
+                fields = {
+                    "weight": "总重33.34吨 袋装",
+                    "cargo": "合金块",
+                    "truck_count": "1",
+                }
+                lines = [("货物锌锭", 100, 100, 300, 140)]
+                opinion = {
+                    "engine": "RapidOCR PP-OCRv5 mobile/OpenVINO",
+                    "target_fields": ["cargo", "weight"],
+                    "fields": {
+                        "cargo": "合金块",
+                        "weight": "总重33-34吨 袋装",
+                    },
+                    "review_fields": [],
+                    "seconds": 0.1,
+                    "raw_pages": [lines],
+                    "applied_fields": [],
+                }
+
+                with (
+                    patch("x001.collect.recognize_detail", return_value=lines),
+                    patch("x001.collect.detail_confirmed", return_value=True),
+                    patch(
+                        "x001.collect.resolve_feedback",
+                        return_value=(fields, {"cargo", "weight"}),
+                    ),
+                    patch("x001.collect.clean_freight"),
+                    patch("x001.collect._second_opinion", return_value=opinion),
+                ):
+                    list(_recognize_group(engine, store, task, {}))
+
+                result = store.db.execute(
+                    "SELECT weight, review_fields, second_opinion "
+                    "FROM freight WHERE capture_id=?",
+                    (capture_id,),
+                ).fetchone()
+            finally:
+                store.db.close()
+
+        self.assertEqual(result["weight"], "总重33-34吨 袋装")
+        self.assertEqual(json.loads(result["review_fields"]), ["cargo"])
+        opinion = json.loads(result["second_opinion"])
+        self.assertEqual(opinion["target_fields"], ["cargo", "weight"])
+        self.assertEqual(opinion["applied_fields"], ["weight"])
+
     def test_second_opinion_is_stored_as_a_suggestion_for_requested_fields(self):
         from types import SimpleNamespace
 
@@ -725,6 +834,7 @@ class FreightTests(unittest.TestCase):
         self.assertEqual(opinion["raw_pages"], [lines])
         self.assertEqual(opinion["engine"], "RapidOCR PP-OCRv5 mobile/OpenVINO")
         self.assertEqual(opinion["target_fields"], ["weight"])
+        self.assertEqual(opinion["applied_fields"], [])
         self.assertGreaterEqual(opinion["seconds"], 0)
 
     def test_unlabeled_address_aligned_with_dropoff_badge_is_recovered(self):
@@ -769,6 +879,35 @@ class FreightTests(unittest.TestCase):
         self.assertEqual(fields["other_info"], "明天6-17点装货")
         self.assertNotIn("other_info", review)
 
+    def test_cleaning_repairs_common_ocr_packaging_suffixes(self):
+        examples = (
+            ("肥料袋〗", "肥料", "33吨 袋装"),
+            ("木材木头散丬", "木材木头", "66-68吨 散装"),
+            ("化工产品袋丬", "化工产品", "34吨 袋装"),
+            ("大葱捆扌", "大葱", "30-35吨 捆扎"),
+        )
+        for cargo, expected_cargo, expected_weight in examples:
+            with self.subTest(cargo=cargo):
+                fields = {
+                    "cargo": cargo,
+                    "weight": expected_weight.split(" ", 1)[0],
+                }
+                review = set()
+
+                clean_freight([], fields, review, "")
+
+                self.assertEqual(fields["cargo"], expected_cargo)
+                self.assertEqual(fields["weight"], expected_weight)
+                self.assertNotIn("cargo", review)
+
+    def test_cleaning_marks_unrecognized_cargo_glyphs_for_review(self):
+        fields = {"cargo": "化肥衣亻弋丬", "weight": "35吨"}
+        review = set()
+
+        clean_freight([], fields, review, "")
+
+        self.assertIn("cargo", review)
+
     def test_cleaning_formats_table_and_keeps_ambiguous_weight_for_review(self):
         lines = [
             ("明天06:00-12:00可装", 41, 49, 600, 120),
@@ -790,6 +929,38 @@ class FreightTests(unittest.TestCase):
             fields["other_info"], "明天06:00-12:00可装；结算4.5/爽约4.4/评价4.5"
         )
         self.assertIn("weight", review)
+
+    def test_cleaning_removes_ocr_vertical_bars_from_locations(self):
+        fields = {
+            "loading_location": "丨银川市|灵武市",
+            "unloading_location": "｜天津市-东丽区丨",
+        }
+        clean_freight([], fields, set(), "")
+        self.assertEqual(fields["loading_location"], "银川市-灵武市")
+        self.assertEqual(fields["unloading_location"], "天津市-东丽区")
+
+    def test_cleaning_removes_repeated_place_and_trailing_marker(self):
+        fields = {
+            "loading_location": "青铜峡青铜峡",
+            "unloading_location": "天津市-东丽区一/",
+            "cargo": "吨包锰铁吨包",
+            "weight": "105吨",
+        }
+        clean_freight([], fields, set(), "")
+        self.assertEqual(fields["loading_location"], "青铜峡")
+        self.assertEqual(fields["unloading_location"], "天津市-东丽区")
+        self.assertEqual(fields["cargo"], "锰铁")
+        self.assertEqual(fields["weight"], "105吨 吨包")
+
+    def test_cleaning_uses_card_time_when_ocr_time_is_clipped(self):
+        fields = {"other_info": "需雨布；以上信息由系统根据货主上传信息自动发送"}
+        clean_freight(
+            [[("明天08:00", 41, 49, 300, 120)]],
+            fields,
+            set(),
+            "锰铁明天8-17点装货|电议",
+        )
+        self.assertEqual(fields["other_info"], "明天8-17点装货；需雨布")
 
     def test_mileage_reads_only_the_estimated_distance_column(self):
         lines = [
@@ -817,6 +988,26 @@ class FreightTests(unittest.TestCase):
         clean_freight([lines], fields, review, key)
         self.assertEqual(fields["price"], "净得6300元(总运费6500元/趟)")
         self.assertNotIn("price", review)
+
+    def test_unitless_price_uses_matching_card_and_detail_unit(self):
+        fields = {"price": "260元"}
+        review = set()
+        lines = [("净得运费260元/吨", 85, 950, 995, 990)]
+
+        clean_freight([lines], fields, review, "锰铁|260元/吨")
+
+        self.assertEqual(fields["price"], "260元/吨")
+        self.assertNotIn("price", review)
+
+    def test_unitless_price_stays_for_review_when_card_and_detail_disagree(self):
+        fields = {"price": "260元"}
+        review = set()
+        lines = [("净得运费260元/吨", 85, 950, 995, 990)]
+
+        clean_freight([lines], fields, review, "锰铁|260元/趟")
+
+        self.assertEqual(fields["price"], "260元")
+        self.assertIn("price", review)
 
     def test_recommended_badge_is_distinct_from_similar(self):
         image = Image.new("RGB", (1080, 2340), (240, 240, 240))

@@ -82,11 +82,16 @@ class Store:
                     card_key TEXT NOT NULL,
                     list_price TEXT,
                     screenshots TEXT,
+                    image_number INTEGER,
                     status TEXT NOT NULL,
                     error TEXT,
                     ocr_seconds REAL
                 );
                 CREATE INDEX IF NOT EXISTS capture_status ON captures(status, id);
+                CREATE TABLE IF NOT EXISTS image_sequence (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    next_number INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS freight (
                     capture_id INTEGER PRIMARY KEY REFERENCES captures(id),
                     ocr_raw TEXT NOT NULL,
@@ -100,6 +105,12 @@ class Store:
             }
             if "route" not in capture_columns:
                 self.db.execute("ALTER TABLE captures ADD COLUMN route TEXT")
+            if "image_number" not in capture_columns:
+                self.db.execute("ALTER TABLE captures ADD COLUMN image_number INTEGER")
+            self.db.execute("""
+                INSERT OR IGNORE INTO image_sequence(id, next_number)
+                SELECT 1, coalesce(max(id), 0) + 1 FROM captures
+            """)
             columns = {
                 row["name"] for row in self.db.execute("PRAGMA table_info(freight)")
             }
@@ -141,6 +152,7 @@ class Store:
             self.db.execute("""
                 UPDATE captures SET status='queued', error=NULL
                 WHERE status IN ('processing', 'ocr_failed')
+                  AND screenshots IS NOT NULL
             """)
 
     def active_count(self) -> int:
@@ -159,16 +171,24 @@ class Store:
 
     def begin(self, key: str, price: str | None, route: str | None = None) -> int:
         with self.db:
+            image_number = self.db.execute("""
+                UPDATE image_sequence SET next_number = next_number + 1
+                WHERE id = 1 RETURNING next_number - 1
+            """).fetchone()[0]
             return self.db.execute(
                 """
-                INSERT INTO captures(card_key, list_price, route, status)
-                VALUES (?, ?, ?, 'capturing')
+                INSERT INTO captures(card_key, list_price, route, image_number, status)
+                VALUES (?, ?, ?, ?, 'capturing')
             """,
-                (key, price, route),
+                (key, price, route, image_number),
             ).lastrowid
 
     def folder(self, capture_id: int) -> Path:
-        return self.captures / str(capture_id)
+        row = self.db.execute(
+            "SELECT image_number FROM captures WHERE id=?", (capture_id,)
+        ).fetchone()
+        number = row[0] if row and row[0] else capture_id
+        return self.captures / str(number)
 
     def publish(
         self, capture_id: int, paths: list[Path], error: str | None = None

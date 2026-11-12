@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#eef5f7"><title>X001 · 货源明细</title><link rel="stylesheet" href="/app.css"><link rel="stylesheet" href="/light.css"></head>
+<body class="page-records"><div class="shell">
+  <aside class="sidebar"><div class="brand"><div class="brandmark">X<span>0</span>01</div><div class="brand-sub">FREIGHT INTELLIGENCE</div></div><div class="nav-label">工作空间</div><a class="nav" href="/"><span>◈</span> 数据总览</a><a class="nav active" href="/records"><span>▦</span> 货源明细</a><a class="nav" href="/console"><span>⌘</span> 采集操作台</a><div class="sidebar-bottom"><div class="device-dot" id="side-dot"></div><div><strong id="side-device">检测设备中</strong><small>Android 手机连接</small></div></div></aside>
+  <main><header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> 货源明细</div><div class="top-right"><span class="live-pill"><i></i> 实时同步</span><span id="clock"></span></div></header>
+  <div class="content"><div class="page-intro"><div class="eyebrow"><span class="line"></span> X001 / DATA EXPLORER</div><p>查看每条货源的识别结果，按线路筛选并导出。</p></div>
+<section class="section-heading" id="records"><div><div class="overline">02 / FREIGHT RECORDS</div><h2>货源明细</h2></div><span class="section-hint">点击记录查看完整识别结果</span></section>
+  <section class="panel table-panel">
+    <div class="table-tools"><div class="search-wrap"><span>⌕</span><input id="search" type="search" placeholder="搜索地点、货物、货主或卡片…" autocomplete="off"></div><div class="select-wrap"><select id="route-filter" aria-label="筛选线路"><option value="">全部线路</option></select><span aria-hidden="true">⌄</span></div><button class="small-btn" id="export">导出筛选结果 Excel ↓</button></div>
+    <div class="record-filters" role="group" aria-label="筛选货源">
+      <label>车型要求<span class="select-wrap"><select id="vehicle-filter"><option value="">全部车型</option><option>高栏</option><option>平板</option><option>厢式</option><option>高低板</option><option>自卸</option><option>冷藏</option></select><span aria-hidden="true">⌄</span></span></label>
+      <label>车长要求<span class="select-wrap"><select id="length-filter"><option value="">全部车长</option><option value="4.2">4.2 米</option><option value="6.8">6.8 米</option><option value="9.6">9.6 米</option><option value="11.7">11.7 米</option><option value="12.5">12.5 米</option><option value="13">13 米</option><option value="13.7">13.7 米</option><option value="15">15 米</option><option value="16">16 米</option><option value="17.5">17.5 米</option><option value="unknown">未显示 / 未明确</option></select><span aria-hidden="true">⌄</span></span></label>
+      <label>需要车数<span class="select-wrap"><select id="trucks-filter"><option value="">全部车数</option><option value="1-2">1–2 辆</option><option value="3-5">3–5 辆</option><option value="6+">6 辆及以上</option><option value="unknown">未显示 / 未明确</option></select><span aria-hidden="true">⌄</span></span></label>
+      <label>运价状态<span class="select-wrap"><select id="price-filter"><option value="">全部运价</option><option value="priced">已标价</option><option value="unpriced">待协商 / 未标价</option></select><span aria-hidden="true">⌄</span></span></label>
+      <label>采集时间<span class="select-wrap"><select id="period-filter"><option value="">全部时间</option><option value="today">今天</option><option value="yesterday">昨天</option><option value="7d">近 7 天</option><option value="30d">近 30 天</option><option value="day">指定日期</option></select><span aria-hidden="true">⌄</span></span></label>
+      <label class="day-field" id="day-field" hidden>指定日期<input id="day-filter" type="date" aria-label="选择采集日期"></label>
+      <button type="button" class="reset-filters" id="reset-filters">清空筛选</button>
+    </div>
+    <div id="mobile-records" class="mobile-records"></div><div class="table-scroll"><table><thead><tr><th>编号</th><th>运输线路 / 地点</th><th>货物</th><th>运输条件</th><th>运价</th><th>采集时间 / 状态</th><th></th></tr></thead><tbody id="rows"></tbody></table></div><div class="table-foot"><span id="record-count">等待数据…</span><span>最多显示最近 200 条匹配记录</span></div>
+  </section>
+  <footer>© X001 · 货源数据中心 <span>为数据而设计</span></footer></div></main></div>
+  <dialog id="detail"><div class="dialog-head"><div><div class="overline">FREIGHT DETAIL</div><h3 id="detail-title">货源详情</h3></div><button id="close-detail" aria-label="关闭">×</button></div><div id="detail-content"></div></dialog><div id="toast" role="status"></div><script src="/app.js"></script></body></html>

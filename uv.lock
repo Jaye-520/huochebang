@@ -2389,6 +2389,7 @@ dependencies = [
     { name = "torchvision", version = "0.29.2+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "transformers" },
     { name = "uiautomator2" },
+    { name = "xlsxwriter" },
 ]
 
 [package.dev-dependencies]
@@ -2407,10 +2408,20 @@ requires-dist = [
     { name = "torchvision", specifier = ">=0.23.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = ">=5.10.0" },
     { name = "uiautomator2", specifier = ">=3.7.1,<4.0.0" },
+    { name = "xlsxwriter", specifier = ">=3.2,<4.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [{ name = "ruff", specifier = ">=0.14.0,<1.0" }]
+
+[[package]]
+name = "xlsxwriter"
+version = "3.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/9c/fb/31bdbf3737222d92ef7d2db4d50089b2253dbbb63ceb6d20a4447f6b7ed0/xlsxwriter-3.3.1.tar.gz", hash = "sha256:0867761912cceac76f97ffa76eeda18c623ae9217f601be8512f55b1af4bdb6e", size = 223040, upload-time = "2026-10-28T22:52:46.592Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/eb/1e6af9959a567901a7e7c7cef2e75883e487df223ed67f9a8977ff863bd8/xlsxwriter-3.3.1-py3-none-any.whl", hash = "sha256:8e2c89e59d733fe59e112317218c64fbbc276d90a8c144ebd6f7fa15e7ab184a", size = 180583, upload-time = "2026-10-28T22:52:45.048Z" },
+]
 
 [[package]]
 name = "yarl"
