@@ -21,6 +21,7 @@ dev = ["ruff>=0.14.0,<1.0"]
 x001 = "x001.ocr:main"
 x001-ocr = "x001.ocr:main"
 x001-collect = "x001.collect:main"
+x001-init = "x001.initialize:main"
 
 [tool.ruff]
 line-length = 88

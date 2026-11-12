@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .vision import Line
 
+DEFAULT_DATABASE = Path("data/x001.sqlite3")
+
 FIELDS = (
     "price",
     "weight",

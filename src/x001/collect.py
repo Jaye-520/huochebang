@@ -27,7 +27,7 @@ from .freight import (
     recognize_detail,
     resolve_feedback,
 )
-from .storage import Store, exclusive_run
+from .storage import DEFAULT_DATABASE, Store, exclusive_run
 from .vision import (
     Card,
     Line,
@@ -532,7 +532,7 @@ def main() -> None:
     parser.add_argument(
         "--database",
         type=Path,
-        default=Path("data/x001.sqlite3"),
+        default=DEFAULT_DATABASE,
         help="SQLite 文件路径（默认 %(default)s）",
     )
     parser.add_argument(

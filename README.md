@@ -13,8 +13,14 @@ X001 从货车帮司机的线路列表读取货源。程序通过 ADB 和 UiAuto
 
 ```powershell
 uv sync
+uv run x001-init
 .\src\x001\platform-tools\adb.exe devices -l
 ```
+
+`x001-init` 会创建本地的 `data/ocr_images/`、`data/ocr_results/`、
+`data/captures/` 和 `data/x001.sqlite3`。这些数据路径已加入 Git 忽略规则。
+初始化可重复运行，已有图片和货源记录会保留。单图 OCR 命令可直接读取指定路径，
+采集命令也会在运行时初始化所需的数据库。
 
 ## 运行采集
 
