@@ -1,1 +1,1 @@
-"""OCR and Android device automation utilities."""
+"""货车帮司机货源采集与图片文字识别。"""

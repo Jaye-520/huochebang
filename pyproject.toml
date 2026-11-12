@@ -1,11 +1,13 @@
 [project]
 name = "x001"
 version = "0.1.0"
-description = "OCR and Android device automation utilities."
+description = "货车帮司机货源采集与图片文字识别"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "numpy>=2.0",
     "paddleocr>=3.7.0,<4.0.0",
+    "pillow>=11.0",
     "torch>=2.8.0",
     "torchvision>=0.23.0",
     "transformers>=5.10.0",
@@ -18,6 +20,7 @@ dev = ["ruff>=0.14.0,<1.0"]
 [project.scripts]
 x001 = "x001.ocr:main"
 x001-ocr = "x001.ocr:main"
+x001-collect = "x001.collect:main"
 
 [tool.ruff]
 line-length = 88
@@ -27,7 +30,7 @@ target-version = "py314"
 select = ["E", "F", "I"]
 
 [tool.uv]
-# PaddleX pins 6.0.2, which has no Windows wheel for this project's Python 3.14.
+# PaddleX 锁定的 6.0.2 未提供适用于 Python 3.14 的 Windows wheel。
 override-dependencies = ["pyyaml==6.0.3"]
 
 [tool.uv.sources]

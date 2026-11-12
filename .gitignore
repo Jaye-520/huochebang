@@ -8,3 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local agent notes and tool caches
+.workbuddy/
+.ruff_cache/
+
+# Generated OCR data and captures
+/data/ocr_images/
+/data/ocr_results/
+*-captures/
+/data/x001.sqlite3*
+/data/x001.lock
+/data/captures/
