@@ -25,6 +25,56 @@ class Response:
 
 
 class LauncherTests(unittest.TestCase):
+    def test_prepare_runtime_falls_back_to_official_source_when_mirror_fails(self):
+        launcher = Launcher.__new__(Launcher)
+        launcher.project = Path.cwd()
+        launcher.events = queue.Queue()
+        launcher.cancel_requested = threading.Event()
+        uv = Path("uv.exe")
+
+        with (
+            patch.object(
+                launcher,
+                "_install_runtime_from_mirror",
+                side_effect=RuntimeError("mirror unavailable"),
+            ),
+            patch.object(launcher, "_run_command") as run_command,
+        ):
+            launcher._prepare_runtime(uv)
+
+        run_command.assert_called_once_with(
+            [
+                str(uv),
+                "sync",
+                "--frozen",
+                "--no-dev",
+                "--python",
+                "3.14",
+                "--no-progress",
+            ],
+            "官方源运行环境准备",
+        )
+
+    def test_prepare_runtime_does_not_fall_back_after_cancellation(self):
+        launcher = Launcher.__new__(Launcher)
+        launcher.project = Path.cwd()
+        launcher.events = queue.Queue()
+        launcher.cancel_requested = threading.Event()
+        launcher.cancel_requested.set()
+
+        with (
+            patch.object(
+                launcher,
+                "_install_runtime_from_mirror",
+                side_effect=RuntimeError("startup cancelled"),
+            ),
+            patch.object(launcher, "_run_command") as run_command,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "startup cancelled"):
+                launcher._prepare_runtime(Path("uv.exe"))
+
+        run_command.assert_not_called()
+
     def test_run_command_decodes_utf8_child_output(self):
         launcher = Launcher.__new__(Launcher)
         launcher.events = queue.Queue()
