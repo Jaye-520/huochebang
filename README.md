@@ -2,7 +2,11 @@
 
 ## Windows 一键启动
 
-在项目根目录运行 `scripts\build_launcher.ps1`，生成 `dist\X001.exe`。
+从 Git 克隆后如果要自行打包，请先在 PowerShell 中运行
+`winget install --id astral-sh.uv -e` 安装 uv。安装后重新打开终端，运行
+`uv --version` 确认可用。也可以参考 [uv 官方安装文档](https://docs.astral.sh/uv/getting-started/installation/)。
+在项目根目录运行 `.\scripts\build_launcher.ps1`，生成 `dist\X001.exe`。
+已有打包好的 `X001.exe` 时，可以直接使用随附的 uv，无需运行打包脚本。
 将 exe 放在项目根目录，或保留在根目录下的 `dist` 文件夹中，然后双击启动。
 启动器会作为「X001 智能控制中心」自动准备 Python 3.14、安装依赖、初始化本地数据、
 启动网页服务并检查手机；就绪后直接打开网页操作台，无需手工先启动网页。

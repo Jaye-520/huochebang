@@ -5,7 +5,16 @@ param(
 $ErrorActionPreference = "Stop"
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$uvCommand = Get-Command uv -ErrorAction Stop
+$uvPath = (Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1).Source
+if (-not $uvPath) {
+    $defaultUvPath = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
+    if (Test-Path -LiteralPath $defaultUvPath -PathType Leaf) {
+        $uvPath = $defaultUvPath
+    } else {
+        throw "uv.exe not found. Run 'winget install --id astral-sh.uv -e', reopen PowerShell, and run 'uv --version' before retrying. See https://docs.astral.sh/uv/getting-started/installation/"
+    }
+}
 $dist = if ($OutputDirectory) {
     $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
 } else {
@@ -15,7 +24,7 @@ $work = Join-Path $root "build\launcher"
 $source = Join-Path $root "src\x001\launcher.py"
 $sourcePath = Join-Path $root "src"
 $icon = Join-Path $root "src\x001\assets\x001.ico"
-$uvBinary = "$($uvCommand.Source);."
+$uvBinary = "$uvPath;."
 $target = Join-Path $dist "X001.exe"
 if (Test-Path -LiteralPath $target -PathType Leaf) {
     try {
@@ -32,7 +41,7 @@ if (Test-Path -LiteralPath $target -PathType Leaf) {
 
 Push-Location $root
 try {
-    uvx --python 3.14 --from pyinstaller pyinstaller `
+    & $uvPath tool run --python 3.14 --from pyinstaller pyinstaller `
         --noconfirm `
         --clean `
         --onefile `
