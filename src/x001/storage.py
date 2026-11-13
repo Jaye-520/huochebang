@@ -203,6 +203,31 @@ class Store:
                 (json.dumps(relative), status, error, capture_id),
             )
 
+    def discard_capture(self, capture_id: int, paths: list[Path]) -> None:
+        """丢弃尚未提交识别队列的临时采集。"""
+        row = self.db.execute(
+            "SELECT status FROM captures WHERE id=?", (capture_id,)
+        ).fetchone()
+        if row is None or row["status"] != "capturing":
+            raise RuntimeError(f"Capture {capture_id} is not an unpublished capture")
+
+        directory = self.folder(capture_id)
+        if any(path.parent != directory for path in paths):
+            raise ValueError("Capture screenshots must be inside its capture folder")
+        for path in paths:
+            path.unlink(missing_ok=True)
+        if directory.exists():
+            directory.rmdir()
+
+        with self.db:
+            self.db.execute("DELETE FROM freight WHERE capture_id=?", (capture_id,))
+            deleted = self.db.execute(
+                "DELETE FROM captures WHERE id=? AND status='capturing'",
+                (capture_id,),
+            ).rowcount
+            if deleted != 1:
+                raise RuntimeError(f"Capture {capture_id} could not be discarded")
+
     def take(self) -> sqlite3.Row | None:
         with self.db:
             return self.db.execute("""

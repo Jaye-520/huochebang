@@ -24,6 +24,7 @@ from .freight import (
     clean_freight,
     detail_confirmed,
     detail_control,
+    detail_removed,
     extract_fields,
     feedback_blocked,
     recognize_detail,
@@ -510,7 +511,9 @@ class Collector:
             view = after
         return "could not confirm the top within 40 return gestures"
 
-    def _capture_detail(self, card: Card, png: bytes, route: str | None = None) -> int:
+    def _capture_detail(
+        self, card: Card, png: bytes, route: str | None = None
+    ) -> int | None:
         capture_id = self.store.begin(card.key, card.price, route)
         paths = []
         try:
@@ -533,6 +536,12 @@ class Collector:
                 if len(paths) == 1:
                     paths.append(paths_for_first)
                 lines = self.worker.request("detail", (capture_id, first_png, 0))
+                if detail_removed(lines):
+                    print(f"#{capture_id} skipped: freight was removed", flush=True)
+                    self.device.back()
+                    sleep(0.65)
+                    self.store.discard_capture(capture_id, paths)
+                    return None
                 control = detail_control(lines)
                 if control is not None and control[0] not in handled:
                     name, (_, x, y, right, bottom) = control
@@ -725,9 +734,12 @@ class Collector:
             )
             if pending is not None:
                 card = view.cards[pending]
-                visits[pending] = self._capture_detail(card, png, route)
+                capture_id = self._capture_detail(card, png, route)
                 captured_keys.add(card.key)
                 returning_from_detail = True
+                if capture_id is None:
+                    continue
+                visits[pending] = capture_id
                 history.append((view.cards, visits.copy()))
                 captured += 1
                 if maximum is not None and captured >= maximum:

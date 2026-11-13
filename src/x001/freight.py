@@ -37,6 +37,12 @@ def detail_confirmed(lines: list[Line]) -> bool:
     )
 
 
+def detail_removed(lines: list[Line]) -> bool:
+    """识别详情页打开时货源已下架的提示。"""
+    text = normalize("".join(line[0] for line in lines))
+    return "该货源已下架" in text or "货主已将货源删除" in text
+
+
 def detail_control(lines: list[Line]) -> tuple[str, Line] | None:
     """查找允许处理的变更提示或货主要求展开入口。"""
     text = normalize("".join(rows(lines)))

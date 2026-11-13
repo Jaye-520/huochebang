@@ -20,6 +20,7 @@ from x001.engines import HybridEngine, WindowsOCR
 from x001.freight import (
     clean_freight,
     detail_control,
+    detail_removed,
     extract_fields,
     feedback_blocked,
     recognize_detail,
@@ -203,6 +204,29 @@ class MatchingTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
+    def test_discard_capture_removes_unpublished_record_and_screenshots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "test.sqlite3")
+            try:
+                store.initialize()
+                capture_id = store.begin("removed", None)
+                directory = store.folder(capture_id)
+                directory.mkdir(parents=True)
+                paths = [directory / "card.png", directory / "detail-01.png"]
+                for path in paths:
+                    path.write_bytes(b"image")
+
+                store.discard_capture(capture_id, paths)
+
+                self.assertIsNone(
+                    store.db.execute(
+                        "SELECT id FROM captures WHERE id=?", (capture_id,)
+                    ).fetchone()
+                )
+                self.assertFalse(directory.exists())
+            finally:
+                store.db.close()
+
     def test_existing_database_adds_route_column_and_keeps_capture_records(self):
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "test.sqlite3")
@@ -316,6 +340,60 @@ class StorageTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    @patch("x001.collect.sleep")
+    def test_removed_detail_notice_discards_capture_and_returns_to_list(self, _sleep):
+        image = Image.new("RGB", (1080, 2340), "white")
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        frame = buffer.getvalue()
+        device, worker = Mock(), Mock()
+        device.screenshot.return_value = frame
+        worker.request.return_value = [
+            ("该货源已下架", 300, 100, 700, 150),
+            ("货主已将货源删除，为您推荐其他相似货源", 100, 180, 950, 240),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Store(Path(temporary) / "test.sqlite3")
+            try:
+                store.initialize()
+                collector = Collector(device, store, worker, 3)
+
+                result = collector._capture_detail(
+                    Card("removed", 270, 900, None), frame, "宁夏河北"
+                )
+
+                self.assertIsNone(result)
+                self.assertEqual(
+                    store.db.execute("SELECT count(*) FROM captures").fetchone()[0],
+                    0,
+                )
+                self.assertFalse((store.captures / "1").exists())
+            finally:
+                store.db.close()
+        device.back.assert_called_once()
+
+    @patch("x001.collect.sleep")
+    def test_removed_freight_is_discarded_and_collection_continues(self, _sleep):
+        png = BytesIO()
+        Image.new("RGB", (1080, 2340), "white").save(png, format="PNG")
+        image = png.getvalue()
+        removed = Card("removed", 270, 600, None)
+        available = Card("available", 270, 950, None)
+        view = Viewport((removed, available), (), False, True, "宁夏河北")
+        store = Mock()
+        store.active_count.return_value = 0
+        collector = Collector(Mock(), store, Mock(), 3)
+        collector._read_list = Mock(return_value=(image, view))
+        collector._capture_detail = Mock(side_effect=[None, 2])
+
+        result = collector.run(1)
+
+        self.assertIn("requested limit (1)", result)
+        self.assertEqual(
+            [call.args[0].key for call in collector._capture_detail.call_args_list],
+            ["removed", "available"],
+        )
+
     @patch("x001.collect.sleep")
     def test_expected_route_rejects_different_phone_route(self, _sleep):
         collector = Collector(Mock(), Mock(), Mock(), 3)
@@ -665,6 +743,17 @@ class CollectorTests(unittest.TestCase):
 
 
 class FreightTests(unittest.TestCase):
+    def test_detail_removed_requires_a_removed_freight_notice(self):
+        self.assertTrue(
+            detail_removed(
+                [
+                    ("该货源已下架", 300, 100, 700, 150),
+                    ("货主已将货源删除，为您推荐其他相似货源", 100, 180, 950, 240),
+                ]
+            )
+        )
+        self.assertFalse(detail_removed([("货主要求先联系", 100, 180, 400, 220)]))
+
     def test_consensus_range_corrects_only_the_suspected_separator(self):
         fields = {"weight": "总重200.210吨 吨包"}
         review = {"weight"}

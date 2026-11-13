@@ -53,9 +53,10 @@ class Console:
 
     def _read_output(self, process: subprocess.Popen[str]) -> None:
         assert process.stdout is not None
-        for line in process.stdout:
-            with self.lock:
-                self.logs.append(line.rstrip())
+        with process.stdout:
+            for line in process.stdout:
+                with self.lock:
+                    self.logs.append(line.rstrip())
         code = process.wait()
         with self.lock:
             self.exit_code = code

@@ -405,8 +405,9 @@ class Launcher:
             process.terminate()
         assert process.stdout is not None
         try:
-            for line in process.stdout:
-                self.events.put(("log", line.rstrip()))
+            with process.stdout:
+                for line in process.stdout:
+                    self.events.put(("log", line.rstrip()))
             code = process.wait()
         finally:
             self.command_process = None
@@ -488,8 +489,9 @@ class Launcher:
         process = self.server
         if process is None or process.stdout is None:
             return
-        for line in process.stdout:
-            self.events.put(("log", line.rstrip()))
+        with process.stdout:
+            for line in process.stdout:
+                self.events.put(("log", line.rstrip()))
         code = process.wait()
         if self.server_stop_requested or self.closing:
             message = (
