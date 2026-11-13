@@ -14,7 +14,6 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from tkinter import messagebox, scrolledtext, ttk
 
 from x001.adb import DEFAULT_ADB_PATH, ADBController, inspect_device
@@ -656,9 +655,7 @@ class Launcher:
         self._set_card("app", "idle", "等待检测", "货车帮司机")
         threading.Thread(target=self._prepare_and_start, daemon=True).start()
 
-    def _run_command(
-        self, command: list[str], description: str, *, env: dict[str, str] | None = None
-    ) -> None:
+    def _run_command(self, command: list[str], description: str) -> None:
         self.events.put(("log", f"开始：{description}"))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         try:
@@ -672,7 +669,7 @@ class Launcher:
                 errors="replace",
                 bufsize=1,
                 creationflags=flags,
-                env={**os.environ, "PYTHONIOENCODING": "utf-8", **(env or {})},
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
             )
         except OSError as error:
             raise RuntimeError(f"无法运行准备程序：{error}") from error
@@ -699,75 +696,6 @@ class Launcher:
         bundled = self.project / "src" / "x001" / "platform-tools" / "adb.exe"
         return bundled if bundled.is_file() else DEFAULT_ADB_PATH
 
-    def _prepare_runtime(self, uv: Path) -> None:
-        assert self.project is not None
-        command = [
-            str(uv),
-            "sync",
-            "--frozen",
-            "--no-dev",
-            "--python",
-            "3.14",
-            "--no-progress",
-        ]
-        try:
-            self._install_runtime_from_mirror(uv, command)
-        except RuntimeError:
-            if self.cancel_requested.is_set():
-                raise
-            self.events.put(("log", "国内镜像安装未完成，正在尝试官方源。"))
-            self._run_command(command, "官方源运行环境准备")
-
-    def _install_runtime_from_mirror(self, uv: Path, command: list[str]) -> None:
-        assert self.project is not None
-        mirror = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web"
-        python = self.project / ".venv" / "Scripts" / "python.exe"
-        env = {
-            "UV_PROJECT_ENVIRONMENT": str(python.parents[1]),
-            "UV_PYTHON_INSTALL_MIRROR": os.environ.get("UV_PYTHON_INSTALL_MIRROR")
-            or "https://mirrors.ustc.edu.cn/github-release/astral-sh/python-build-standalone/",
-        }
-        # Frozen sync uses the artifact URLs in the lockfile. Keep the original
-        # lockfile and hashes intact while trying the mirror in a temporary project.
-        with TemporaryDirectory(prefix="x001-mirror-") as directory:
-            project = Path(directory)
-            for name in ("pyproject.toml", "README.md"):
-                shutil.copyfile(self.project / name, project / name)
-            lock = (self.project / "uv.lock").read_text(encoding="utf-8")
-            (project / "uv.lock").write_text(
-                lock.replace(
-                    "https://files.pythonhosted.org/packages/", mirror + "/packages/"
-                ),
-                encoding="utf-8",
-            )
-            self._run_command(
-                [
-                    *command,
-                    "--project",
-                    directory,
-                    "--no-install-project",
-                    "--default-index",
-                    mirror + "/simple",
-                ],
-                "国内镜像依赖安装",
-                env=env,
-            )
-        self._run_command(
-            [
-                str(uv),
-                "pip",
-                "install",
-                "--python",
-                str(python),
-                "--no-deps",
-                "--default-index",
-                mirror + "/simple",
-                "--editable",
-                str(self.project),
-            ],
-            "安装 X001",
-        )
-
     def _prepare_and_start(self) -> None:
         assert self.project is not None
         try:
@@ -775,7 +703,10 @@ class Launcher:
             if uv is None:
                 raise RuntimeError("未找到运行组件管理器 uv，请使用随附的 X001.exe。")
             self.events.put(("progress", (1, "正在验证运行环境")))
-            self._prepare_runtime(uv)
+            self._run_command(
+                [str(uv), "sync", "--frozen", "--python", "3.14", "--no-progress"],
+                "运行环境准备",
+            )
             python = self.project / ".venv" / "Scripts" / "python.exe"
             if not python.is_file():
                 raise RuntimeError("Python 环境未创建成功，请检查诊断日志后重试。")
