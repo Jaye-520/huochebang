@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -14,9 +15,19 @@ from x001.web import Console, Handler, WebServer, local_timestamp
 
 
 class WebConsoleTests(unittest.TestCase):
-    @patch("x001.web.subprocess.run")
-    def test_device_probe_uses_the_shared_platform_adb_path(self, run):
-        run.return_value = Mock(stdout="List of devices attached\nserial\tdevice\n")
+    @patch("x001.web.inspect_device")
+    def test_device_probe_uses_the_shared_platform_adb_path(self, inspect):
+        inspect.return_value = {
+            "adb_available": True,
+            "connected": True,
+            "devices": [{"serial": "7450df55", "state": "device"}],
+            "target_serial": "7450df55",
+            "target_state": "device",
+            "screen_awake": True,
+            "unlocked": True,
+            "package_installed": True,
+            "foreground": True,
+        }
         server = WebServer(("127.0.0.1", 0), Console(Path("test.sqlite3")), None)
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
@@ -29,18 +40,14 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(response.read()),
                     {
-                        "connected": True,
-                        "devices": ["serial"],
+                        **inspect.return_value,
+                        "devices": ["7450df55"],
+                        "device_states": [{"serial": "7450df55", "state": "device"}],
                     },
                 )
             finally:
                 connection.close()
-            run.assert_called_once_with(
-                [str(DEFAULT_ADB_PATH), "devices"],
-                capture_output=True,
-                text=True,
-                timeout=4,
-            )
+            inspect.assert_called_once_with(adb_path=DEFAULT_ADB_PATH)
         finally:
             server.shutdown()
             server.server_close()
@@ -102,6 +109,105 @@ class WebConsoleTests(unittest.TestCase):
                 connection.close()
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
+        finally:
+            if thread.is_alive():
+                server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_health_reports_service_and_database_readiness(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "test.sqlite3"
+            store = Store(database)
+            store.initialize()
+            store.db.close()
+            server = WebServer(("127.0.0.1", 0), Console(database), None)
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                connection = http.client.HTTPConnection(
+                    *server.server_address, timeout=2
+                )
+                try:
+                    connection.request("GET", "/api/health")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(
+                        json.loads(response.read()),
+                        {
+                            "ok": True,
+                            "service": "x001",
+                            "database_ready": True,
+                            "collector_running": False,
+                        },
+                    )
+                finally:
+                    connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_close_waits_for_collector_and_escalates_when_needed(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("collect", 0), 0]
+        console = Console(Path("test.sqlite3"))
+        console.process = process
+
+        console.close(timeout=0.01)
+
+        process.terminate.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_old_collector_output_does_not_update_the_new_task(self):
+        class Output:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                return iter(["旧任务输出\n"])
+
+        old = Mock()
+        old.stdout = Output()
+        old.wait.return_value = 9
+        console = Console(Path("test.sqlite3"))
+        console.process = Mock()
+
+        console._read_output(old)
+
+        self.assertEqual(list(console.logs), [])
+        self.assertIsNone(console.exit_code)
+
+    def test_shutdown_endpoint_stops_a_running_collector(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        console = Console(Path("test.sqlite3"))
+        console.process = process
+        server = WebServer(("127.0.0.1", 0), console, None)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            connection = http.client.HTTPConnection(*server.server_address, timeout=2)
+            try:
+                connection.request(
+                    "POST",
+                    "/api/shutdown",
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                response.read()
+            finally:
+                connection.close()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            process.wait.assert_called_once()
         finally:
             if thread.is_alive():
                 server.shutdown()
@@ -222,9 +328,7 @@ class WebConsoleTests(unittest.TestCase):
         console.start("process", None, 3, "auto")
 
         self.assertEqual(popen.call_args.kwargs["encoding"], "utf-8")
-        self.assertEqual(
-            popen.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8"
-        )
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
         thread.assert_called_once()
 
     @patch("x001.web.BaseHTTPRequestHandler.handle")

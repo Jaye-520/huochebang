@@ -1,12 +1,79 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#eef5f7"><title>X001 · 数据总览</title><link rel="stylesheet" href="/app.css"><link rel="stylesheet" href="/light.css"></head>
-<body class="page-overview"><div class="shell">
-  <aside class="sidebar"><div class="brand"><div class="brandmark">X<span>0</span>01</div><div class="brand-sub">FREIGHT INTELLIGENCE</div></div><div class="nav-label">工作空间</div><a class="nav active" href="/"><span>◈</span> 数据总览</a><a class="nav" href="/records"><span>▦</span> 货源明细</a><a class="nav" href="/console"><span>⌘</span> 采集操作台</a><div class="sidebar-bottom"><div class="device-dot" id="side-dot"></div><div><strong id="side-device">检测设备中</strong><small>Android 手机连接</small></div></div></aside>
-  <main><header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> 数据总览</div><div class="top-right"><span class="live-pill"><i></i> 实时同步</span><span id="clock"></span></div></header>
-  <div class="content"><section class="hero" id="overview"><div class="hero-orbit"></div><div class="eyebrow"><span class="line"></span> FREIGHT DATA INTELLIGENCE</div><h1>从采集到分析，<br><em>让数据给出答案。</em></h1><p>实时掌握线路、货物结构与字段完整度。每一条结论都能回到原始货源和截图核对。</p><div class="hero-actions"><a class="button primary" href="/records">探索货源数据 <span>↗</span></a><a class="button ghost" href="/console">打开采集操作台 <span>→</span></a></div><div class="hero-status"><span class="pulse"></span><span id="hero-running">采集器待命</span><b>·</b><span id="hero-sync">等待同步</span></div></section>
-  <section class="section-heading"><div><div class="overline">01 / OPERATION PULSE</div><h2>数据总览</h2></div><span class="section-hint">来自本地 SQLite · 每 2 秒更新</span></section>
-  <div class="stats"><article class="stat"><div class="stat-top"><span>总采集货源</span><span class="stat-icon">▤</span></div><strong id="stat-total">—</strong><small>全部截图任务</small></article><article class="stat"><div class="stat-top"><span>已完成识别</span><span class="stat-icon cyan">✧</span></div><strong id="stat-done">—</strong><small>可查看详细字段</small></article><article class="stat"><div class="stat-top"><span>处理中</span><span class="stat-icon blue">◷</span></div><strong id="stat-pending">—</strong><small>采集 / 排队 / OCR</small></article><article class="stat"><div class="stat-top"><span>需要关注</span><span class="stat-icon amber">◇</span></div><strong id="stat-failed">—</strong><small>采集或识别失败</small></article></div>
-  <div class="insights"><section class="panel activity"><div class="panel-head"><div><div class="overline">ACTIVITY</div><h3>采集活跃趋势</h3></div><span>最近 12 个活跃小时</span></div><div class="chart" id="chart"></div></section><section class="panel routes"><div class="panel-head"><div><div class="overline">ROUTES</div><h3>线路分布</h3></div><span id="route-count">0 条线路</span></div><div id="route-bars" class="route-bars"></div><p class="panel-note">网页采集前会校验手机当前线路；历史记录中未保存线路的货源不会归入任何线路。</p></section></div>
-  <div class="analysis-toolbar"><div><div class="overline">ANALYSIS WORKSPACE</div><h2>线路数据分析</h2></div><div class="select-wrap"><select id="analysis-route" aria-label="分析线路"><option value="">全部线路</option></select><span aria-hidden="true">⌄</span></div></div><div class="insights analysis-grid"><section class="panel"><div class="panel-head"><div><div class="overline">CARGO MIX</div><h3>货物类型 Top 6</h3></div><span>按已识别记录统计</span></div><div id="cargo-bars" class="route-bars"></div></section><section class="panel"><div class="panel-head"><div><div class="overline">DATA QUALITY</div><h3>字段完整度</h3></div><span>已识别记录</span></div><div class="quality-grid"><div><strong id="quality-price">—</strong><span>运价填写率</span></div><div><strong id="quality-weight">—</strong><span>重量填写率</span></div><div><strong id="quality-review">—</strong><span>待人工核对</span></div></div><p class="panel-note">填写率仅表示字段非空，不代表 OCR 结果准确；请结合详情截图核对。</p></section></div>
-  <footer>© X001 · 货源数据中心 <span>为数据而设计</span></footer></div></main></div>
-<div id="toast" role="status"></div><script src="/app.js"></script></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>X001 · 线路规划</title>
+  <meta name="theme-color" content="#eef5f7">
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/light.css">
+  <link rel="stylesheet" href="/atlas.css">
+</head>
+<body class="page-atlas">
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand"><div class="brandmark">X<span>0</span>01</div><div class="brand-sub">FREIGHT INTELLIGENCE</div></div>
+    <div class="nav-label">工作空间</div>
+    <a class="nav active" href="/"><span>◈</span> 线路规划</a>
+    <a class="nav" href="/records"><span>▦</span> 货源明细</a>
+    <a class="nav" href="/console"><span>⌘</span> 采集操作台</a>
+    <div class="sidebar-bottom"><div class="device-dot" id="side-dot"></div><div><strong id="side-device">检测设备中</strong><small>Android 手机连接</small></div></div>
+  </aside>
+  <main>
+    <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> 线路规划</div><div class="top-right"><span class="live-pill"><i></i> 本地数据</span><span id="clock"></span></div></header>
+    <div class="content">
+      <section class="heading">
+        <div><p class="eyebrow">ROUTE PLANNER / 冀 · 津 · 宁</p><h1>先定线路，再看沿途机会。</h1><p class="intro">选择装卸城市，比较候选线路，并结合参考走廊查看节点货源。</p></div>
+        <div class="summary" aria-label="当前规划统计">
+          <div><strong id="total">—</strong><span>匹配货源</span></div>
+          <div><strong id="route-total">—</strong><span>候选线路</span></div>
+          <div><strong id="numeric-price">—</strong><span>数字运价覆盖</span></div>
+        </div>
+      </section>
+
+      <section class="planner" aria-label="线路规划条件">
+        <div class="endpoint-field"><span class="field-index">A</span><label for="origin-input">起点城市</label><input id="origin-input" list="city-options" placeholder="例如：银川" autocomplete="off"></div>
+        <button id="swap" class="swap-button" aria-label="交换起点和终点" title="交换起点和终点">⇄</button>
+        <div class="endpoint-field"><span class="field-index destination">B</span><label for="destination-input">终点城市</label><input id="destination-input" list="city-options" placeholder="例如：唐山" autocomplete="off"></div>
+        <datalist id="city-options"></datalist>
+        <button id="plan" class="plan-button">规划线路 <span>→</span></button>
+        <div class="plan-options"><label>采集时间 <select id="period"><option value="">全部时间</option><option value="today">今天</option><option value="7d">近 7 天</option><option value="30d">近 30 天</option></select></label><button id="reset" class="text-button">全部重置</button></div>
+        <div class="planner-status"><span id="planner-status">可只填起点或终点，也可以直接在地图上依次选择两个城市。</span><button id="refresh" class="refresh-button">刷新数据</button><span id="sync" role="status">正在读取…</span></div>
+      </section>
+
+      <div class="workspace">
+        <aside class="route-panel">
+          <div class="panel-title"><div><span class="eyebrow">01 / CANDIDATES</span><h2>候选线路 <span id="route-count"></span></h2></div></div>
+          <div class="route-search"><input id="search" placeholder="在当前结果中搜货物、地址" aria-label="搜索候选线路"></div>
+          <p class="panel-hint">按货源量排列，同时比较数字运价、里程和最近采集时间。</p>
+          <div id="route-groups" class="route-groups"></div>
+        </aside>
+
+        <section class="map-panel">
+          <div class="map-head"><div><span class="eyebrow">02 / ROUTE MAP</span><h2 id="map-title">货源流向总览</h2></div><div class="map-controls"><button id="zoom-in" aria-label="放大地图">＋</button><button id="zoom-out" aria-label="缩小地图">−</button><button id="reset-map">复位</button></div></div>
+          <p id="map-context" class="map-context">在地图上依次点击两个城市，即可形成起点和终点。</p>
+          <div class="place-tools"><select id="map-region" aria-label="地图范围"><option value="">全局城市</option><option value="河北">河北 · 区县</option><option value="天津">天津 · 区县</option><option value="宁夏">宁夏 · 区县</option></select><input id="place-search" list="place-options" placeholder="查找城市或区县" aria-label="查找地图地名"><datalist id="place-options"></datalist><button id="find-place">定位并选择</button><span id="place-status" role="status"></span></div>
+          <div class="map-stage"><svg id="map" viewBox="0 0 1000 640" role="img" aria-label="河北、天津、宁夏及周边城市离线地图"><defs><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#d9e8eb" stroke-width=".6"/></pattern></defs><rect width="1000" height="640" fill="url(#grid)"/><g id="geography"></g></svg><span class="north">N<br>↑</span><div class="map-caption"><span class="dot"></span> 有货城市 <span class="legend-dash"></span> 当前线路 <span class="legend-line"></span> 参考走廊</div></div>
+          <div class="corridor-bar"><span>叠加参考走廊</span><div id="corridors" class="corridor-switch"></div></div>
+          <div class="stop-section"><div class="stop-heading"><strong>沿途节点货源</strong><span>点击节点不会清除当前线路</span></div><div id="stops" class="stops"></div></div>
+          <p class="map-note">城市连线与走廊仅用于规划对照，不代表实际道路、通行条件或无需绕行。</p>
+        </section>
+
+        <aside class="freight-panel">
+          <div class="panel-title"><div><span class="eyebrow">03 / FREIGHT</span><h2><span id="freight-title" class="route-view-title">线路货源</span> <span id="freight-count"></span></h2></div><button id="route-clear" class="text-button" hidden>返回线路</button></div>
+          <p id="route-intro" class="context-note">从左侧选择一条候选线路，在这里比较该线路的全部货源。</p>
+          <div id="route-summary" class="route-summary" hidden></div>
+          <div id="route-orders" class="route-orders"></div>
+        </aside>
+      </div>
+      <footer><span>X001 / 线路规划与沿途货源</span><span>货源数据留在本机 · 地图无需密钥</span></footer>
+    </div>
+  </main>
+</div>
+
+<dialog id="freight-detail" class="freight-detail"><div class="dialog-head"><div><span class="eyebrow">FREIGHT DETAIL</span><h3 id="detail-title">货源详情</h3></div><button id="close-detail" aria-label="关闭货源详情">×</button></div><div id="detail-content"></div></dialog>
+<div id="notice" role="alert" hidden></div>
+<script src="/atlas.js"></script>
+<script src="/shell.js"></script>
+</body>
+</html>

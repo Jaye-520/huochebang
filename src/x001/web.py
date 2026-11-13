@@ -21,7 +21,8 @@ from tempfile import TemporaryDirectory
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import uuid4
 
-from .adb import DEFAULT_ADB_PATH
+from .adb import DEFAULT_ADB_PATH, inspect_device
+from .atlas import atlas_snapshot
 from .export import export_workbook
 from .filters import FreightFilters
 from .storage import DEFAULT_DATABASE, FIELDS, REPORT_FIELDS, Store, exclusive_run
@@ -45,6 +46,7 @@ class Console:
     def __init__(self, database: Path):
         self.database = database.resolve()
         self.lock = threading.RLock()
+        self.close_lock = threading.Lock()
         self.process: subprocess.Popen[str] | None = None
         self.mode = ""
         self.started_at = ""
@@ -56,11 +58,13 @@ class Console:
         with process.stdout:
             for line in process.stdout:
                 with self.lock:
-                    self.logs.append(line.rstrip())
+                    if self.process is process:
+                        self.logs.append(line.rstrip())
         code = process.wait()
         with self.lock:
-            self.exit_code = code
-            self.logs.append(f"采集进程已结束，退出码 {code}")
+            if self.process is process:
+                self.exit_code = code
+                self.logs.append(f"采集进程已结束，退出码 {code}")
 
     def start(
         self,
@@ -203,18 +207,69 @@ class Console:
                 finally:
                     store.db.close()
 
+    @staticmethod
+    def _signal_stop(process: subprocess.Popen[str]) -> None:
+        if os.name == "nt":
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            except OSError:
+                process.terminate()
+        else:
+            process.send_signal(signal.SIGINT)
+
     def stop(self) -> None:
         with self.lock:
             if self.process is None or self.process.poll() is not None:
                 raise ValueError("当前没有正在运行的任务")
             self.logs.append("正在停止任务…")
-            if os.name == "nt":
+            self._signal_stop(self.process)
+
+    def close(self, timeout: float = 8) -> None:
+        """停止并回收采集进程；服务退出和重复关闭共用同一路径。"""
+        with self.close_lock:
+            with self.lock:
+                process = self.process
+                if process is None or process.poll() is not None:
+                    return
+                self.logs.append("服务正在退出，等待采集任务安全停止…")
+                self._signal_stop(process)
+            try:
+                process.wait(timeout=timeout)
+                return
+            except subprocess.TimeoutExpired:
+                with self.lock:
+                    self.logs.append("采集任务未及时退出，正在结束进程…")
+                process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+    def health(self) -> dict:
+        database_ready = False
+        if self.database.is_file():
+            try:
+                db = sqlite3.connect(
+                    f"file:{self.database.as_posix()}?mode=ro", uri=True, timeout=1
+                )
                 try:
-                    self.process.send_signal(signal.CTRL_BREAK_EVENT)
-                except OSError:
-                    self.process.terminate()
-            else:
-                self.process.send_signal(signal.SIGINT)
+                    database_ready = bool(
+                        db.execute(
+                            "SELECT 1 FROM sqlite_master "
+                            "WHERE type='table' AND name='captures'"
+                        ).fetchone()
+                    )
+                finally:
+                    db.close()
+            except sqlite3.Error:
+                pass
+        return {
+            "ok": True,
+            "service": "x001",
+            "database_ready": database_ready,
+            "collector_running": self.process_state()["running"],
+        }
 
     def process_state(self) -> dict:
         with self.lock:
@@ -365,7 +420,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle(self) -> None:
         try:
             super().handle()
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+        except BrokenPipeError, ConnectionAbortedError, ConnectionResetError:
             pass
 
     def _authorized(self) -> bool:
@@ -410,6 +465,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self._json(200, self.server.console.health())
+            return
+        if parsed.path == "/api/atlas":
+            query = parse_qs(parsed.query)
+            try:
+                data = atlas_snapshot(
+                    self.server.console.database,
+                    query.get("route", [""])[0][:100],
+                    query.get("period", [""])[0][:30],
+                )
+                for record in data["records"]:
+                    record["captured_at"] = local_timestamp(record["captured_at"])
+                self._json(200, data)
+            except (ValueError, sqlite3.Error) as error:
+                self._json(400, {"error": str(error)})
+            return
         if parsed.path == "/api/snapshot":
             query = parse_qs(parsed.query)
             try:
@@ -432,18 +504,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(503, {"error": f"数据库暂时不可读：{error}"})
             return
         if parsed.path == "/api/device":
-            try:
-                result = subprocess.run(
-                    [str(ADB), "devices"], capture_output=True, text=True, timeout=4
-                )
-                devices = [
-                    line.split()[0]
-                    for line in result.stdout.splitlines()[1:]
-                    if line.strip().endswith("device")
-                ]
-                self._json(200, {"connected": bool(devices), "devices": devices})
-            except (OSError, subprocess.TimeoutExpired) as error:
-                self._json(200, {"connected": False, "error": str(error)})
+            report = inspect_device(adb_path=ADB)
+            device_states = report["devices"]
+            report["devices"] = [
+                item["serial"] for item in device_states if item["state"] == "device"
+            ]
+            report["device_states"] = device_states
+            self._json(200, report)
             return
         if parsed.path == "/api/image":
             query = parse_qs(parsed.query)
@@ -498,6 +565,11 @@ class Handler(BaseHTTPRequestHandler):
             "app.css",
             "light.css",
             "app.js",
+            "atlas.js",
+            "shell.js",
+            "atlas.css",
+            "atlas-data.json",
+            "china-map.json",
         }:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -508,6 +580,11 @@ class Handler(BaseHTTPRequestHandler):
             "app.css": "text/css; charset=utf-8",
             "light.css": "text/css; charset=utf-8",
             "app.js": "text/javascript; charset=utf-8",
+            "atlas.js": "text/javascript; charset=utf-8",
+            "shell.js": "text/javascript; charset=utf-8",
+            "atlas.css": "text/css; charset=utf-8",
+            "atlas-data.json": "application/json; charset=utf-8",
+            "china-map.json": "application/json; charset=utf-8",
         }
         self._send(200, (STATIC / name).read_bytes(), types[name])
 
@@ -551,7 +628,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
             elif self.path == "/api/shutdown":
                 self._json(200, {"ok": True})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                threading.Thread(
+                    target=self.server.graceful_shutdown, daemon=True
+                ).start()
             else:
                 self._json(200, self.server.console.clear_images())
         except (ValueError, TypeError, json.JSONDecodeError, OSError) as error:
@@ -562,10 +641,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class WebServer(ThreadingHTTPServer):
+    daemon_threads = True
+
     def __init__(self, address: tuple[str, int], console: Console, token: str | None):
         super().__init__(address, Handler)
         self.console = console
         self.token = token
+
+    def graceful_shutdown(self) -> None:
+        self.console.close()
+        self.shutdown()
 
 
 def main() -> None:
@@ -581,7 +666,8 @@ def main() -> None:
         if args.host not in {"127.0.0.1", "localhost", "::1"}
         else None
     )
-    server = WebServer((args.host, args.port), Console(args.database), token)
+    console = Console(args.database)
+    server = WebServer((args.host, args.port), console, token)
     print(f"X001 操作台: http://{args.host}:{args.port}", flush=True)
     if token:
         print(f"局域网访问：用户名 x001，密码 {token}", flush=True)
@@ -590,6 +676,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        console.close()
         server.server_close()
 
 

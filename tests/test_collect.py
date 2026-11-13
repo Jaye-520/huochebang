@@ -21,6 +21,7 @@ from x001.freight import (
     clean_freight,
     detail_control,
     detail_removed,
+    detail_removed_control,
     extract_fields,
     feedback_blocked,
     recognize_detail,
@@ -349,8 +350,9 @@ class CollectorTests(unittest.TestCase):
         device, worker = Mock(), Mock()
         device.screenshot.return_value = frame
         worker.request.return_value = [
-            ("该货源已下架", 300, 100, 700, 150),
-            ("货主已将货源删除，为您推荐其他相似货源", 100, 180, 950, 240),
+            ("返回", 33, 389, 130, 445),
+            ("该货源已被抢", 388, 383, 692, 438),
+            ("货源已走~为您推荐其他相似货源", 100, 450, 950, 510),
         ]
         with tempfile.TemporaryDirectory() as temporary:
             store = Store(Path(temporary) / "test.sqlite3")
@@ -370,7 +372,8 @@ class CollectorTests(unittest.TestCase):
                 self.assertFalse((store.captures / "1").exists())
             finally:
                 store.db.close()
-        device.back.assert_called_once()
+            device.tap.assert_any_call(81, 651)
+            device.back.assert_not_called()
 
     @patch("x001.collect.sleep")
     def test_removed_freight_is_discarded_and_collection_continues(self, _sleep):
@@ -400,7 +403,7 @@ class CollectorTests(unittest.TestCase):
         collector._read_list = Mock(
             return_value=(b"list", Viewport((), (), False, True, "宁夏天津"))
         )
-        with self.assertRaisesRegex(RuntimeError, "expected='宁夏河北'"):
+        with self.assertRaisesRegex(RuntimeError, "本轮要求「宁夏河北」"):
             collector._wait_for_list("宁夏河北")
 
     @patch("x001.collect.sleep")
@@ -525,7 +528,9 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(collector._wait_for_list("宁夏河北"), original)
 
         collector._read_list = Mock(return_value=other)
-        with self.assertRaisesRegex(RuntimeError, "last OCR route='宁夏天津'"):
+        with self.assertRaisesRegex(
+            RuntimeError, "手机当前线路为「宁夏天津」，本轮要求「宁夏河北」"
+        ):
             collector._wait_for_list("宁夏河北")
 
     @patch("x001.collect.sleep")
@@ -752,6 +757,14 @@ class FreightTests(unittest.TestCase):
                 ]
             )
         )
+        notice = [
+            ("返回", 33, 389, 130, 445),
+            ("该货源已被抢", 388, 383, 692, 438),
+            ("货源已走~为您推荐其他相似货源", 100, 450, 950, 510),
+        ]
+        self.assertTrue(detail_removed(notice))
+        self.assertEqual(detail_removed_control(notice), notice[0])
+        self.assertIsNone(detail_removed_control([("返回", 30, 40, 100, 80)]))
         self.assertFalse(detail_removed([("货主要求先联系", 100, 180, 400, 220)]))
 
     def test_consensus_range_corrects_only_the_suspected_separator(self):
@@ -765,6 +778,20 @@ class FreightTests(unittest.TestCase):
 
         self.assertTrue(_reconcile_consensus_weight(fields, review, opinion))
         self.assertEqual(fields["weight"], "总重200-210吨 吨包")
+        self.assertEqual(review, set())
+        self.assertEqual(opinion["applied_fields"], ["weight"])
+
+    def test_consensus_weight_preserves_volume_when_secondary_only_reads_weight(self):
+        fields = {"weight": "总重60.70吨 60-70方"}
+        review = {"weight"}
+        opinion = {
+            "fields": {"weight": "总重60-70吨"},
+            "review_fields": [],
+            "applied_fields": [],
+        }
+
+        self.assertTrue(_reconcile_consensus_weight(fields, review, opinion))
+        self.assertEqual(fields["weight"], "总重60-70吨 60-70方")
         self.assertEqual(review, set())
         self.assertEqual(opinion["applied_fields"], ["weight"])
 
@@ -997,6 +1024,34 @@ class FreightTests(unittest.TestCase):
 
         self.assertIn("cargo", review)
 
+    def test_cleaning_moves_volume_past_ocr_suffix_to_weight(self):
+        fields = {"cargo": "化肥复合肥60-70方卩", "weight": "总重60-70吨"}
+        review = set()
+
+        clean_freight([], fields, review, "")
+
+        self.assertEqual(fields["cargo"], "化肥复合肥")
+        self.assertEqual(fields["weight"], "总重60-70吨 60-70方")
+        self.assertIn("cargo", review)
+
+    def test_cleaning_removes_floating_find_button_text_and_marks_review(self):
+        fields = {"cargo": "镀锌压块压±找货《", "weight": "总重66吨"}
+        review = set()
+
+        clean_freight([], fields, review, "")
+
+        self.assertEqual(fields["cargo"], "镀锌压块压")
+        self.assertIn("cargo", review)
+
+    def test_cleaning_strips_unreadable_cargo_tail_but_keeps_clear_prefix(self):
+        fields = {"cargo": "化肥衣亻弋丬士", "weight": "总重35吨"}
+        review = set()
+
+        clean_freight([], fields, review, "")
+
+        self.assertEqual(fields["cargo"], "化肥")
+        self.assertIn("cargo", review)
+
     def test_cleaning_formats_table_and_keeps_ambiguous_weight_for_review(self):
         lines = [
             ("明天06:00-12:00可装", 41, 49, 600, 120),
@@ -1175,6 +1230,73 @@ class FreightTests(unittest.TestCase):
         fields, review = resolve_feedback([first, later], [1080, 1080], None, "")
         self.assertEqual(fields["loading_location"], "银川市灵武市物流中心")
         self.assertEqual(review, set())
+
+    def test_feedback_merged_into_address_is_detected_as_obstruction(self):
+        lines = [
+            (
+                "卸:亠石家庄市·藁城区·藁城北收费站(货源反馈澳高速入口)",
+                140,
+                519,
+                1065,
+                645,
+            ),
+            ("货源反馈", 926, 569, 1065, 602),
+        ]
+
+        fields, review = resolve_feedback([lines], [1080], None, "")
+
+        self.assertNotIn("unloading_location", fields)
+        self.assertEqual(review, {"unloading_location"})
+
+    def test_feedback_at_end_of_address_does_not_hide_the_visible_location(self):
+        lines = [
+            ("卸:石家庄市·栾城区 一/货源反馈", 140, 519, 1065, 590),
+            ("货源反馈", 926, 569, 1065, 602),
+        ]
+
+        fields, review = resolve_feedback([lines], [1080], None, "")
+        clean_freight([lines], fields, review, "")
+
+        self.assertEqual(fields["unloading_location"], "石家庄市-栾城区")
+        self.assertNotIn("unloading_location", review)
+
+    def test_conflicting_cargo_readings_across_pages_require_review(self):
+        pages = [
+            [("货物化肥总重量35吨衣", 293, 656, 970, 697)],
+            [("货物化肥总重量35吨袋装", 293, 656, 994, 697)],
+        ]
+
+        fields, review = resolve_feedback(pages, [1080, 1080], None, "")
+
+        self.assertEqual(fields["cargo"], "化肥袋装")
+        self.assertIn("cargo", review)
+
+    def test_packaging_difference_alone_does_not_mark_cargo_for_review(self):
+        pages = [
+            [("货物地铺石pc砖总重量33吨托盘", 293, 656, 970, 697)],
+            [("货物地铺石pc砖总重量33吨托", 293, 656, 994, 697)],
+        ]
+
+        fields, review = resolve_feedback(pages, [1080, 1080], None, "")
+        clean_freight(pages, fields, review, "")
+
+        self.assertEqual(fields["cargo"], "地铺石pc砖")
+        self.assertEqual(fields["weight"], "总重33吨 托盘")
+        self.assertNotIn("cargo", review)
+
+    def test_card_text_confirms_the_complete_cargo_across_conflicting_pages(self):
+        pages = [
+            [("货物镀锌压块总重量66吨压±找货《", 293, 656, 970, 697)],
+            [("货物镀锌压块总重量66吨压块", 293, 656, 994, 697)],
+        ]
+
+        fields, review = resolve_feedback(
+            pages, [1080, 1080], None, "石家庄镀锌压块压块明天装货|电议"
+        )
+        clean_freight(pages, fields, review, "")
+
+        self.assertEqual(fields["cargo"], "镀锌压块压块")
+        self.assertIn("cargo", review)
 
     def test_truck_count_without_number_preserves_the_visible_label(self):
         lines = [

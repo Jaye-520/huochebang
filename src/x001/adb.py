@@ -3,6 +3,7 @@
 import math
 import os
 import random
+import re
 import subprocess
 import time
 from bisect import bisect_left
@@ -22,6 +23,109 @@ _DEFAULT_SCREEN_SIZE = (1080, 2340)
 DEFAULT_ADB_PATH = (
     Path(__file__).parent / "platform-tools" / "adb.exe" if os.name == "nt" else "adb"
 )
+
+# 窗口程序里调用 ADB 时不弹出黑色控制台窗口。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
+def _adb_output(
+    arguments: list[str], adb_path: str | Path, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [str(adb_path), *arguments],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        creationflags=_NO_WINDOW,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(detail or f"ADB 命令执行失败（退出码 {result.returncode}）")
+    return result
+
+
+def list_devices(
+    adb_path: str | Path = DEFAULT_ADB_PATH, *, timeout: float = 4
+) -> list[dict[str, str]]:
+    """返回全部 ADB 设备及其状态，不把未授权设备误报为未连接。"""
+    result = _adb_output(["devices"], adb_path, timeout)
+    devices = []
+    for line in result.stdout.splitlines()[1:]:
+        fields = line.strip().split()
+        if len(fields) >= 2:
+            devices.append({"serial": fields[0], "state": fields[1]})
+    return devices
+
+
+def inspect_device(
+    serial: str = _TARGET_SERIAL,
+    adb_path: str | Path = DEFAULT_ADB_PATH,
+    *,
+    timeout: float = 4,
+) -> dict:
+    """检查目标手机、锁屏和货车帮司机状态，不执行解锁或页面操作。"""
+    report = {
+        "adb_available": False,
+        "connected": False,
+        "devices": [],
+        "target_serial": serial,
+        "target_state": "missing",
+        "screen_awake": None,
+        "unlocked": None,
+        "package_installed": None,
+        "foreground": False,
+    }
+    try:
+        devices = list_devices(adb_path, timeout=timeout)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        report["error"] = str(error)
+        return report
+    report["adb_available"] = True
+    report["devices"] = devices
+    target = next((item for item in devices if item["serial"] == serial), None)
+    if target is not None:
+        report["target_state"] = target["state"]
+    report["connected"] = report["target_state"] == "device"
+    if not report["connected"]:
+        return report
+
+    def shell(*arguments: str) -> str:
+        return _adb_output(
+            ["-s", serial, "shell", *arguments], adb_path, timeout
+        ).stdout
+
+    try:
+        power = shell("dumpsys", "power")
+        wakefulness = re.search(r"mWakefulness=(\w+)", power)
+        if wakefulness:
+            report["screen_awake"] = wakefulness.group(1) == "Awake"
+        window = shell("dumpsys", "window")
+        lock_markers = [
+            re.search(rf"{name}=(true|false)", window)
+            for name in (
+                "mDreamingLockscreen",
+                "mKeyguardShowing",
+                "isStatusBarKeyguardShowing",
+            )
+        ]
+        known_locks = [match.group(1) == "true" for match in lock_markers if match]
+        if known_locks:
+            report["unlocked"] = not any(known_locks)
+        foreground_lines = re.findall(
+            r"^\s*(?:mCurrentFocus|mFocusedApp|topResumedActivity)=.*$",
+            window,
+            flags=re.MULTILINE,
+        )
+        report["foreground"] = any(_TARGET_PACKAGE in line for line in foreground_lines)
+        if report["foreground"]:
+            report["unlocked"] = True
+        package = shell("pm", "path", _TARGET_PACKAGE)
+        report["package_installed"] = "package:" in package
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        report["error"] = str(error)
+    return report
 
 
 @dataclass(frozen=True)
@@ -340,6 +444,10 @@ class ADBController:
             humanize=humanize,
         )
 
+    def wake(self) -> None:
+        """唤醒屏幕；不会尝试绕过用户的锁屏密码。"""
+        self._run("shell", "input", "keyevent", "KEYCODE_WAKEUP")
+
     def launch(self) -> None:
         self._run("shell", "am", "start", "-n", _TARGET_ACTIVITY)
 
@@ -350,6 +458,7 @@ class ADBController:
             check=True,
             capture_output=True,
             timeout=self.timeout,
+            creationflags=_NO_WINDOW,
         ).stdout
 
     def _linear_swipe(
@@ -426,6 +535,7 @@ class ADBController:
             capture_output=True,
             text=True,
             timeout=self.timeout,
+            creationflags=_NO_WINDOW,
         )
 
     def _command(self, *args: str) -> list[str]:

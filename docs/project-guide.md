@@ -19,7 +19,7 @@ X001 在本地 Android 手机上浏览货车帮司机货源，保存列表和详
 | `src/x001/filters.py` | 网页和 Excel 共用的筛选校验及 SQL 条件。 |
 | `src/x001/export.py` | CSV 与 Excel 导出、字段复核提示和输出安全处理。 |
 | `src/x001/web.py`、`src/x001/web_static/` | 本地 HTTP 服务、JSON 接口和操作台前端。 |
-| `src/x001/launcher.py` | Windows GUI 启动器。 |
+| `src/x001/launcher.py` | Windows 智能控制中心：准备环境、健康检查、设备预检、固定端口启停网页服务。 |
 | `scripts/` | Windows 打包脚本和一次性数据迁移工具。 |
 | `tests/` | 使用标准库 `unittest` 的离线测试。 |
 

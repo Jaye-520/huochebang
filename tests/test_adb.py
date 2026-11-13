@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from x001 import adb
-from x001.adb import ADBController
+from x001.adb import ADBController, inspect_device, list_devices
+
+_CREATION_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 def _expected_default_adb_path() -> str:
@@ -26,6 +28,7 @@ class ADBControllerTests(unittest.TestCase):
             check=True,
             capture_output=True,
             timeout=10,
+            creationflags=_CREATION_FLAGS,
         )
 
     def test_defaults_are_pinned_to_huochebang_driver(self) -> None:
@@ -55,6 +58,7 @@ class ADBControllerTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=_CREATION_FLAGS,
         )
 
     @patch("x001.adb.subprocess.run")
@@ -73,6 +77,7 @@ class ADBControllerTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=_CREATION_FLAGS,
         )
 
     @patch("x001.adb.subprocess.run")
@@ -97,6 +102,7 @@ class ADBControllerTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=_CREATION_FLAGS,
         )
 
     @patch("x001.adb.subprocess.run")
@@ -116,6 +122,7 @@ class ADBControllerTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=_CREATION_FLAGS,
         )
 
     def test_rejects_negative_coordinates(self) -> None:
@@ -127,6 +134,87 @@ class ADBControllerTests(unittest.TestCase):
         with patch("x001.adb.subprocess.run", side_effect=error):
             with self.assertRaises(subprocess.CalledProcessError):
                 ADBController(serial=None, input_backend="adb").back()
+
+
+class DeviceInspectionTests(unittest.TestCase):
+    @staticmethod
+    def _result(stdout: str, returncode: int = 0, stderr: str = "") -> Mock:
+        result = Mock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    def test_list_devices_keeps_authorized_and_pending_states(self) -> None:
+        with patch(
+            "x001.adb.subprocess.run",
+            return_value=self._result(
+                "List of devices attached\n7450df55\tdevice\nother\tunauthorized\n"
+            ),
+        ) as run:
+            self.assertEqual(
+                list_devices("adb"),
+                [
+                    {"serial": "7450df55", "state": "device"},
+                    {"serial": "other", "state": "unauthorized"},
+                ],
+            )
+        self.assertEqual(run.call_args.args[0], ["adb", "devices"])
+
+    def test_inspect_device_reports_target_lock_and_app_state(self) -> None:
+        outputs = [
+            self._result("List of devices attached\n7450df55\tdevice\n"),
+            self._result("mWakefulness=Awake\n"),
+            self._result(
+                "mKeyguardShowing=false\n"
+                "mCurrentFocus=Window{u0 com.wlqq/com.wlqq.activity.HomeActivity}\n"
+            ),
+            self._result("package:/data/app/com.wlqq/base.apk\n"),
+        ]
+        with patch("x001.adb.subprocess.run", side_effect=outputs) as run:
+            report = inspect_device("7450df55", adb_path="adb")
+        self.assertTrue(report["adb_available"])
+        self.assertTrue(report["connected"])
+        self.assertEqual(report["target_state"], "device")
+        self.assertTrue(report["screen_awake"])
+        self.assertTrue(report["unlocked"])
+        self.assertTrue(report["package_installed"])
+        self.assertTrue(report["foreground"])
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["adb", "-s", "7450df55", "shell", "dumpsys", "power"],
+        )
+
+    def test_inspect_device_distinguishes_unauthorized_from_missing(self) -> None:
+        with patch(
+            "x001.adb.subprocess.run",
+            return_value=self._result(
+                "List of devices attached\n7450df55\tunauthorized\n"
+            ),
+        ) as run:
+            report = inspect_device("7450df55", adb_path="adb")
+        self.assertFalse(report["connected"])
+        self.assertEqual(report["target_state"], "unauthorized")
+        self.assertEqual(run.call_count, 1)
+
+        with patch(
+            "x001.adb.subprocess.run",
+            return_value=self._result("List of devices attached\n"),
+        ):
+            report = inspect_device("7450df55", adb_path="adb")
+        self.assertEqual(report["target_state"], "missing")
+
+    def test_inspect_device_reports_adb_command_failure(self) -> None:
+        with patch(
+            "x001.adb.subprocess.run",
+            return_value=self._result(
+                "", returncode=1, stderr="adb server is out of date"
+            ),
+        ):
+            report = inspect_device("7450df55", adb_path="adb")
+        self.assertFalse(report["adb_available"])
+        self.assertIn("adb server is out of date", report["error"])
 
 
 class UIAutomatorBackendTests(unittest.TestCase):

@@ -40,7 +40,17 @@ def detail_confirmed(lines: list[Line]) -> bool:
 def detail_removed(lines: list[Line]) -> bool:
     """识别详情页打开时货源已下架的提示。"""
     text = normalize("".join(line[0] for line in lines))
-    return "该货源已下架" in text or "货主已将货源删除" in text
+    return any(
+        notice in text
+        for notice in ("该货源已下架", "货主已将货源删除", "该货源已被抢")
+    )
+
+
+def detail_removed_control(lines: list[Line]) -> Line | None:
+    """查找失效货源弹窗自身的返回按钮。"""
+    if not detail_removed(lines):
+        return None
+    return next((line for line in lines if normalize(line[0]) == "返回"), None)
 
 
 def detail_control(lines: list[Line]) -> tuple[str, Line] | None:
@@ -359,12 +369,16 @@ def clean_freight(
             if match := re.fullmatch(r"([\u4e00-\u9fff]{2,})\1", address):
                 address = match[1]
             fields[key] = address
-            if re.search(r"[，,丿《“”]|^市-|[\u4e00-\u9fff][Oo0]$", address):
+            if re.search(r"[，,丿《“”亠]|^市-|[\u4e00-\u9fff][Oo0]$", address):
                 review.add(key)
 
     details = []
     volume = None
     if cargo := fields.get("cargo"):
+        cleaned_cargo = re.sub(r"(?:[±卩]+|找货[《〈<]*)+$", "", cargo)
+        if cleaned_cargo != cargo:
+            review.add("cargo")
+        cargo = cleaned_cargo
         if delivery := re.search(r"(卸(?:货地:?)?个人货场)$", cargo):
             details.append(delivery[1])
             cargo = cargo[: delivery.start()]
@@ -372,17 +386,23 @@ def clean_freight(
             if cargo.endswith(observed):
                 cargo = cargo[: -len(observed)] + corrected
                 break
+        cleaned_cargo = re.sub(r"(?:[亻弋丬士]|衣(?=[亻弋丬士]))+$", "", cargo)
+        if cleaned_cargo != cargo:
+            review.add("cargo")
+        cargo = cleaned_cargo
         if packaging := _PACKAGING.search(cargo):
             cargo = cargo[: packaging.start()].rstrip(",")
             if cargo.startswith(packaging[1]) and len(cargo) > len(packaging[1]):
                 cargo = cargo[len(packaging[1]) :]
-        if "weight" in fields and (size := re.search(r"(\d+(?:-\d+)?方)$", cargo)):
+        if "weight" in fields and (size := re.search(r"(\d+(?:-\d+)?方)(吨?)$", cargo)):
             volume = size[1]
+            if size[2]:
+                review.add("cargo")
             cargo = cargo[: size.start()]
         if "总重量" in cargo:
             review.update(("cargo", "weight"))
             cargo = re.sub(r"总重量\d+(?:[.．]\d*)?$", "", cargo)
-        if re.search(r"[〗丬扌亻弋]", cargo):
+        if re.search(r"[〗丬扌亻弋卩±]", cargo):
             review.add("cargo")
         if cargo:
             fields["cargo"] = cargo
@@ -612,11 +632,18 @@ def feedback_blocked(lines: list[Line], width: int) -> set[str]:
     edge = max(left, right - width * 0.14) - width * 0.08
     margin = width * 0.025
     fields = set()
-    text_lines = [line for line in lines if "货源反馈" not in line[0]]
+    text_lines = lines
     for label, keys in _FIELD_LABELS.items():
         for text, x, y, x2, y2 in text_lines:
-            if not normalize(text).startswith(label):
+            normalized = normalize(text)
+            if not normalized.startswith(label):
                 continue
+            if "货源反馈" in normalized:
+                marker_tail = normalized.split("货源反馈", 1)[1]
+                if not marker_tail or re.fullmatch(
+                    r"[一/|丨｜.·，,。:：()（）]*", marker_tail
+                ):
+                    continue
             if label == "货主要求":
                 # 货主要求可能换行，范围截止于后续字段标签。
                 stop = min(
@@ -649,15 +676,56 @@ def resolve_feedback(
     pages: list[list[Line]], widths: list[int], list_price: str | None, card_key: str
 ) -> tuple[dict[str, str], set[str]]:
     fields = extract_fields(pages, list_price, card_key)
+    observations = [extract_fields([lines], None, card_key) for lines in pages]
+    review = set()
+    cargo_values = {
+        normalize(observation["cargo"])
+        for observation in observations
+        if observation.get("cargo")
+    }
+    if len(cargo_values) > 1:
+        packaged = [
+            observation["cargo"]
+            for observation in observations
+            if observation.get("cargo") and _PACKAGING.search(observation["cargo"])
+        ]
+        if len(packaged) == 1:
+            packaged_value = packaged[0]
+            package_match = _PACKAGING.search(packaged_value)
+            cargo_base = normalize(_PACKAGING.sub("", packaged_value).rstrip(","))
+            package_suffix = package_match[1] if package_match else ""
+            has_packaging_variant = any(
+                value.startswith(cargo_base)
+                and package_suffix.startswith(value[len(cargo_base) :])
+                for value in cargo_values
+            )
+            suspect_tail = re.compile(r"(?:[衣亻弋丬士±卩]|找货[《〈<]*)+$")
+            has_suspect_variant = any(
+                (tail := value[len(cargo_base) :]) and re.fullmatch(suspect_tail, tail)
+                for value in cargo_values
+                if value.startswith(cargo_base)
+            )
+            if has_packaging_variant or has_suspect_variant:
+                fields["cargo"] = packaged_value
+            if has_suspect_variant:
+                review.add("cargo")
+        else:
+            card_confirmed = {
+                normalize(observation["cargo"]): observation["cargo"]
+                for observation in observations
+                if observation.get("cargo")
+                and normalize(observation["cargo"]) in normalize(card_key)
+            }
+            if len(card_confirmed) == 1:
+                fields["cargo"] = next(iter(card_confirmed.values()))
+                review.add("cargo")
     blocked = [
         feedback_blocked(lines, width)
         for lines, width in zip(pages, widths, strict=True)
     ]
     affected = set().union(*blocked)
     if not affected:
-        return fields, set()
-    observations = [extract_fields([lines], None, card_key) for lines in pages]
-    review = set()
+        return fields, review
     for key in affected:
         candidates = [
             extracted[key]

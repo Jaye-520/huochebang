@@ -25,6 +25,7 @@ from .freight import (
     detail_confirmed,
     detail_control,
     detail_removed,
+    detail_removed_control,
     extract_fields,
     feedback_blocked,
     recognize_detail,
@@ -230,10 +231,23 @@ def _reconcile_consensus_weight(
         + match.group().replace(".", "-", 1)
         + primary[match.end() :]
     )
-    if range_candidate != secondary:
+    expected_weight = (
+        (match["prefix"] or "") + match["lower"] + "-" + match["upper"] + "吨"
+    )
+    secondary_match = re.search(
+        r"(?P<prefix>总重)?(?P<lower>[1-9]\d+)-(?P<upper>[1-9]\d+)吨",
+        secondary,
+    )
+    if not secondary_match or secondary_match.group() != expected_weight:
+        return False
+    if secondary == range_candidate:
+        corrected = secondary
+    elif secondary == expected_weight:
+        corrected = range_candidate
+    else:
         return False
 
-    fields["weight"] = secondary
+    fields["weight"] = corrected
     review.remove("weight")
     opinion["applied_fields"].append("weight")
     return True
@@ -422,6 +436,11 @@ class Collector:
                 back_taps += 1
             if attempt + 1 < _LIST_READ_ATTEMPTS:
                 sleep(0.8)
+        if route and view.is_list and view.route and view.route != route:
+            raise _RouteListError(
+                f"手机当前线路为「{view.route}」，本轮要求「{route}」。"
+                "请在手机上打开对应线路，或修改操作台的本轮线路后重试。"
+            )
         raise _RouteListError(
             f"Could not confirm the freight route list after {_LIST_READ_ATTEMPTS} "
             f"checks (expected={route!r}, last OCR route={view.route!r}, "
@@ -538,7 +557,15 @@ class Collector:
                 lines = self.worker.request("detail", (capture_id, first_png, 0))
                 if detail_removed(lines):
                     print(f"#{capture_id} skipped: freight was removed", flush=True)
-                    self.device.back()
+                    control = detail_removed_control(lines)
+                    if control is None:
+                        self.device.back()
+                    else:
+                        _, x, y, right, bottom = control
+                        self.device.tap(
+                            (x + right) // 2,
+                            (y + bottom) // 2 + int(first_image.height * 0.10),
+                        )
                     sleep(0.65)
                     self.store.discard_capture(capture_id, paths)
                     return None
