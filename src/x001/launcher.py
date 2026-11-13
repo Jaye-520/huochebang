@@ -711,12 +711,15 @@ class Launcher:
             "--no-progress",
         ]
         try:
-            self._run_command(command, "运行环境准备")
-            return
+            self._install_runtime_from_mirror(uv, command)
         except RuntimeError:
             if self.cancel_requested.is_set():
                 raise
-        self.events.put(("log", "默认下载线路未完成，正在尝试国内镜像。"))
+            self.events.put(("log", "国内镜像安装未完成，正在尝试官方源。"))
+            self._run_command(command, "官方源运行环境准备")
+
+    def _install_runtime_from_mirror(self, uv: Path, command: list[str]) -> None:
+        assert self.project is not None
         mirror = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web"
         python = self.project / ".venv" / "Scripts" / "python.exe"
         env = {
